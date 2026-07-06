@@ -1,4 +1,4 @@
-# BustyAudiobooks Stremio Audiobook Addon
+# BusTAudiobooks Stremio Audiobook Addon
 
 A Stremio addon that searches for audiobooks and resolves playable or downloadable links through your TorBox account. Each user installs it with their own TorBox API key baked into the install URL, so there is no shared server state and no database.
 
@@ -125,7 +125,7 @@ test/parse.test.js: Unit tests for the pure logic
 
 ## Legal disclaimer
 
-BusTAudio is a neutral piece of software. It does not host, contain, or directly distribute any copyrighted material. It is just a search aggregator and API router that sends text and links to TorBox.
+BusTAudioBooks is a neutral piece of software. It does not host, contain, or directly distribute any copyrighted material. It is just a search aggregator and API router that sends text and links to TorBox.
 
 When you use this addon, you are plugging in your own TorBox API key. You are entirely responsible for the content you choose to access and for ensuring you have the legal right to stream or download it.
 
