@@ -1,0 +1,16 @@
+[Unit]
+Description=BusTAudio Stremio addon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=opc
+WorkingDirectory=/home/opc/torbox-audiobooks-addon
+EnvironmentFile=/etc/bustaudio.env
+ExecStart=/usr/bin/node src/index.js
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
