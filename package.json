@@ -1,6 +1,6 @@
 {
   "name": "torbox-audiobooks-addon",
-  "version": "1.6.0",
+  "version": "1.9.0",
   "description": "A Stremio addon that finds audiobooks and resolves playable/downloadable links through TorBox.",
   "main": "src/index.js",
   "type": "commonjs",

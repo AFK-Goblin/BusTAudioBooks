@@ -1,0 +1,22 @@
+{
+  "Port": 9117,
+  "AllowExternal": false,
+  "APIKey": "bustaudioselfhostkey000000000000",
+  "AdminPassword": "",
+  "InstanceId": "",
+  "BlackholeDir": "",
+  "UpdateDisabled": false,
+  "UpdatePrerelease": false,
+  "BasePathOverride": "",
+  "BaseUrlOverride": "",
+  "CacheEnabled": true,
+  "CacheTtl": 2100,
+  "CacheMaxResultsPerIndexer": 1000,
+  "FlareSolverrUrl": "http://flaresolverr:8191",
+  "FlareSolverrMaxTimeout": 55000,
+  "OmdbApiKey": "",
+  "OmdbApiUrl": "",
+  "ProxyType": 0,
+  "ProxyUrl": "",
+  "ProxyPort": null
+}

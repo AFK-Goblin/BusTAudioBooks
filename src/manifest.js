@@ -4,8 +4,8 @@ const ID_PREFIX = "tbab:"; // "TorBox AudioBook" — our custom stream/meta ids
 
 const manifest = {
   id: "community.torbox.audiobooks",
-  version: "1.6.0",
-  name: "BusTAudio",
+  version: "1.9.0",
+  name: "BusTAudioBooks",
   description:
     "Search audiobooks and stream or download them through your TorBox account.",
   // "audiobook" is a custom content type. Stremio shows it under Discover and

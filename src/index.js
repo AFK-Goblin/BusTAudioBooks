@@ -73,7 +73,7 @@ const CONFIGURE_HTML = `<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>BusTAudio — Configure</title>
+<title>BusTAudioBooks — Configure</title>
 <style>
   :root { color-scheme: dark; }
   body { font-family: system-ui, sans-serif; background:#15101c; color:#ece8f1;
@@ -95,7 +95,7 @@ const CONFIGURE_HTML = `<!doctype html>
               text-decoration:none; }
 </style></head>
 <body>
-  <h1>BusTAudio</h1>
+  <h1>BusTAudioBooks</h1>
   <p class="sub">Search &amp; stream audiobooks through your TorBox account.</p>
 
   <label>TorBox API key <small>(required)</small></label>
@@ -201,6 +201,62 @@ app.get("/:config/manifest.json", (req, res) => {
   res.json({ ...manifest, behaviorHints: { ...manifest.behaviorHints, configurationRequired: false } });
 });
 
+// ---- Shared search (used by both the Stremio catalog and the app API) -------
+// Returns enriched result items: the raw source item plus { poster, author,
+// cached }. Cached per query/page so both consumers share the heavy work.
+async function runSearch(cfg, query, page) {
+  const instantOnly = isInstantOnly(cfg);
+  const effJackett = cfg.jackettUrl || process.env.JACKETT_URL || "";
+  const cacheKey = `${cfg.abbDomain || ""}|${effJackett}|${instantOnly ? "I" : ""}|${query}|${page}`;
+  const hit = searchCache.get(cacheKey);
+  if (hit) return hit;
+
+  let results = [];
+  try {
+    results = await searchAudiobooks(cfg, query, page);
+  } catch (err) {
+    console.error("search error:", err.message);
+  }
+  results = results.slice(0, 40);
+
+  let cachedSet = new Set();
+  try {
+    const hashes = results.map((r) => r.infohash).filter(Boolean);
+    if (hashes.length) cachedSet = await torbox.checkCachedMany(cfg.apiKey, hashes);
+  } catch (_) {
+    /* non-critical */
+  }
+
+  if (instantOnly) results = results.filter((r) => r.infohash && cachedSet.has(r.infohash));
+
+  results.sort((a, b) => {
+    const ca = a.infohash && cachedSet.has(a.infohash) ? 1 : 0;
+    const cb = b.infohash && cachedSet.has(b.infohash) ? 1 : 0;
+    if (ca !== cb) return cb - ca;
+    const qa = qualityScore(a);
+    const qb = qualityScore(b);
+    if (qa !== qb) return qb - qa;
+    return (b.seeders || 0) - (a.seeders || 0);
+  });
+
+  const enriched = await Promise.all(
+    results.map((r) =>
+      limitMeta(async () => {
+        const meta = await withTimeout(enrich(r.name), 2500, { poster: null, author: null });
+        return {
+          ...r,
+          poster: meta.poster || null,
+          author: meta.author || null,
+          cached: !!(r.infohash && cachedSet.has(r.infohash)),
+        };
+      })()
+    )
+  );
+
+  searchCache.set(cacheKey, enriched);
+  return enriched;
+}
+
 // ---- Catalog (search only) --------------------------------------------------
 async function handleCatalog(req, res, extraRaw) {
   const cfg = getConfig(req, res);
@@ -221,73 +277,23 @@ async function handleCatalog(req, res, extraRaw) {
   const PAGE_SIZE = 12;
   const skip = parseInt(extra.skip, 10) || 0;
   const page = Math.floor(skip / PAGE_SIZE) + 1;
-  const instantOnly = isInstantOnly(cfg);
 
-  // Cache the heavy work (search + cached-check + enrichment) per query/page.
-  const effJackett = cfg.jackettUrl || process.env.JACKETT_URL || "";
-  const cacheKey = `${cfg.abbDomain || ""}|${effJackett}|${instantOnly ? "I" : ""}|${query}|${page}`;
-  const cached = searchCache.get(cacheKey);
-  if (cached) return res.json({ metas: cached });
-
-  let results = [];
-  try {
-    results = await searchAudiobooks(cfg, query, page);
-  } catch (err) {
-    console.error("catalog search error:", err.message);
-  }
-  results = results.slice(0, 40);
-
-  // One batch call tells us which results TorBox can stream instantly.
-  // (Only results that expose an infohash can be pre-checked; Jackett .torrent
-  // links resolve their hash only at play time.)
-  let cachedSet = new Set();
-  try {
-    const hashes = results.map((r) => r.infohash).filter(Boolean);
-    if (hashes.length) cachedSet = await torbox.checkCachedMany(cfg.apiKey, hashes);
-  } catch (_) {
-    /* non-critical */
-  }
-
-  // In instant-only mode, hide anything TorBox can't serve immediately.
-  if (instantOnly) results = results.filter((r) => r.infohash && cachedSet.has(r.infohash));
-
-  // Instant-on-TorBox first, then by likely quality, then seeders.
-  results.sort((a, b) => {
-    const ca = a.infohash && cachedSet.has(a.infohash) ? 1 : 0;
-    const cb = b.infohash && cachedSet.has(b.infohash) ? 1 : 0;
-    if (ca !== cb) return cb - ca;
-    const qa = qualityScore(a);
-    const qb = qualityScore(b);
-    if (qa !== qb) return qb - qa;
-    return (b.seeders || 0) - (a.seeders || 0);
-  });
-
-  // Best-effort cover art (capped, timed-out, cached) so the grid looks real.
-  const metas = await Promise.all(
-    results.map((r) =>
-      limitMeta(async () => {
-        const meta = await withTimeout(enrich(r.name), 2500, { poster: null, author: null });
-        const isCached = !!(r.infohash && cachedSet.has(r.infohash));
-        const line = detailLine([
-          isCached ? "⚡ Instant" : null,
-          r.format,
-          r.bitrate,
-          torbox.formatBytes(r.size),
-          meta.author,
-        ]);
-        return {
-          id: encodeItemId(r),
-          type: "audiobook",
-          name: prettyName(r.name),
-          poster: meta.poster || undefined,
-          posterShape: "square",
-          description: line || r.tracker,
-        };
-      })()
-    )
-  );
-
-  searchCache.set(cacheKey, metas);
+  const items = await runSearch(cfg, query, page);
+  const metas = items.map((r) => ({
+    id: encodeItemId(r),
+    type: "audiobook",
+    name: prettyName(r.name),
+    poster: r.poster || undefined,
+    posterShape: "square",
+    description:
+      detailLine([
+        r.cached ? "⚡ Instant" : null,
+        r.format,
+        r.bitrate,
+        torbox.formatBytes(r.size),
+        r.author,
+      ]) || r.tracker,
+  }));
   res.json({ metas });
 }
 
@@ -335,6 +341,25 @@ app.get("/:config/meta/:type/:id.json", async (req, res) => {
   });
 });
 
+// ---- Shared stream resolution (Stremio + app) -------------------------------
+// Returns { ready, status, streams } where streams are raw {title,url,filename,
+// behaviorHints}. Cached per (apiKey, item) so re-opens don't re-hit TorBox.
+async function resolveForItem(cfg, item) {
+  const key = streamKey(cfg.apiKey, item.infohash || item.torrentUrl || item.name);
+  const cachedStreams = streamCache.get(key);
+  if (cachedStreams) return { ready: true, status: "ok", streams: cachedStreams };
+
+  const result = await torbox.resolveStreams(cfg.apiKey, {
+    magnet: item.magnet,
+    infohash: item.infohash,
+    torrentUrl: item.torrentUrl,
+    name: item.name,
+    instantOnly: isInstantOnly(cfg),
+  });
+  if (result.ready) streamCache.set(key, result.streams);
+  return result;
+}
+
 // ---- Stream -----------------------------------------------------------------
 app.get("/:config/stream/:type/:id.json", async (req, res) => {
   const cfg = getConfig(req, res);
@@ -344,35 +369,18 @@ app.get("/:config/stream/:type/:id.json", async (req, res) => {
 
   const tag = detailLine([item.format, item.bitrate]);
   const decorate = (streams) =>
-    streams.map((s) => ({ ...s, name: tag ? `BusTAudio\n${tag}` : "BusTAudio" }));
-
-  // Serve resolved streams from cache so re-opening a book is instant and
-  // doesn't re-hit the TorBox API (links stay valid well within the TTL).
-  // Key on the infohash when known, else the torrent link, so hashless Jackett
-  // items don't collide.
-  const key = streamKey(cfg.apiKey, item.infohash || item.torrentUrl || item.name);
-  const cachedStreams = streamCache.get(key);
-  if (cachedStreams) return res.json({ streams: decorate(cachedStreams) });
+    streams.map((s) => ({ ...s, name: tag ? `BusTAudioBooks\n${tag}` : "BusTAudioBooks" }));
 
   try {
-    const result = await torbox.resolveStreams(cfg.apiKey, {
-      magnet: item.magnet,
-      infohash: item.infohash,
-      torrentUrl: item.torrentUrl,
-      name: item.name,
-      instantOnly: isInstantOnly(cfg),
-    });
-
+    const result = await resolveForItem(cfg, item);
     if (result.ready) {
-      streamCache.set(key, result.streams);
       return res.json({ streams: decorate(result.streams) });
     }
-
     // Not cached yet: surface a non-playable info entry so the user knows to wait.
     return res.json({
       streams: [
         {
-          name: "BusTAudio",
+          name: "BusTAudioBooks",
           title: `⏳ ${result.status}`,
           externalUrl: "https://torbox.app/",
         },
@@ -381,12 +389,76 @@ app.get("/:config/stream/:type/:id.json", async (req, res) => {
   } catch (err) {
     console.error("stream error:", err.message);
     return res.json({
-      streams: [{ name: "BusTAudio", title: `⚠️ ${err.message}`, externalUrl: "https://torbox.app/" }],
+      streams: [{ name: "BusTAudioBooks", title: `⚠️ ${err.message}`, externalUrl: "https://torbox.app/" }],
     });
   }
 });
 
-// ---- Health / diagnostics ---------------------------------------------------
+// ---- App JSON API (for the native app) --------------------------------------
+// Simple, app-friendly endpoints backed by the same search + TorBox logic.
+
+// GET /:config/app/search?q=...&page=1
+app.get("/:config/app/search", async (req, res) => {
+  const cfg = getConfig(req, res);
+  if (!cfg) return;
+  const query = String(req.query.q || "").trim();
+  if (!query) return res.json({ results: [] });
+  const page = parseInt(req.query.page, 10) || 1;
+
+  const items = await runSearch(cfg, query, page);
+  res.json({
+    results: items.map((r) => ({
+      id: encodeItemId(r),
+      title: prettyName(r.name),
+      author: r.author || null,
+      poster: r.poster || null,
+      format: r.format || null,
+      bitrate: r.bitrate || null,
+      size: r.size || 0,
+      sizeText: torbox.formatBytes(r.size) || null,
+      cached: !!r.cached,
+    })),
+  });
+});
+
+// GET /:config/app/streams/:id  -> playable files for a book
+app.get("/:config/app/streams/:id", async (req, res) => {
+  const cfg = getConfig(req, res);
+  if (!cfg) return;
+  const item = decodeItemId(req.params.id);
+  if (!item) return res.status(400).json({ ready: false, streams: [], status: "Bad item id" });
+
+  try {
+    const result = await resolveForItem(cfg, item);
+    return res.json({
+      ready: !!result.ready,
+      status: result.status || (result.ready ? "ok" : "preparing"),
+      title: prettyName(item.name),
+      format: item.format || null,
+      bitrate: item.bitrate || null,
+      streams: (result.streams || []).map((s) => ({
+        title: (s.behaviorHints && s.behaviorHints.filename) || s.title || item.name,
+        url: s.url,
+        filename: (s.behaviorHints && s.behaviorHints.filename) || null,
+      })),
+    });
+  } catch (err) {
+    console.error("app streams error:", err.message);
+    return res.status(502).json({ ready: false, streams: [], status: err.message });
+  }
+});
+
+// GET /:config/app/version  -> latest native APK info (for in-app update prompt)
+app.get("/:config/app/version", (req, res) => {
+  const cfg = getConfig(req, res);
+  if (!cfg) return;
+  res.json({
+    latestVersion: process.env.APP_LATEST_VERSION || null,
+    apkUrl: process.env.APP_APK_URL || null,
+    minVersion: process.env.APP_MIN_VERSION || null,
+  });
+});
+
 async function handleHealth(req, res) {
   const cfg = decodeConfig(req.params.config || "");
   const out = {
@@ -416,6 +488,6 @@ app.get("/health", handleHealth);
 app.get("/:config/health", handleHealth);
 
 app.listen(PORT, () => {
-  console.log(`BusTAudio addon running on http://127.0.0.1:${PORT}`);
+  console.log(`BusTAudioBooks addon running on http://127.0.0.1:${PORT}`);
   console.log(`Open http://127.0.0.1:${PORT}/configure to generate your install link.`);
 });

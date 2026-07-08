@@ -1,0 +1,44 @@
+name: bustaudio
+
+services:
+  # The search indexer. Config (incl. a pre-set API key) is seeded from
+  # ./selfhost/jackett-config so the backend can talk to it with no manual copy.
+  jackett:
+    image: lscr.io/linuxserver/jackett:latest
+    container_name: bustaudio-jackett
+    restart: unless-stopped
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+    volumes:
+      - ./selfhost/jackett-config:/config
+    ports:
+      # Bound to localhost only — you open this once to add the AudiobookBay
+      # indexer, but it's never exposed to the internet.
+      - "127.0.0.1:9117:9117"
+
+  # Solves AudiobookBay's Cloudflare "are you human" checks so search works.
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: bustaudio-flaresolverr
+    restart: unless-stopped
+    environment:
+      - LOG_LEVEL=warning
+
+  # The BusTAudioBooks backend (search + TorBox resolution + app API).
+  backend:
+    build: .
+    container_name: bustaudio-backend
+    restart: unless-stopped
+    depends_on:
+      - jackett
+    environment:
+      - PORT=7000
+      - JACKETT_URL=http://jackett:9117
+      # Must match APIKey in selfhost/jackett-config/Jackett/ServerConfig.json.
+      - JACKETT_API_KEY=bustaudioselfhostkey000000000000
+      # Personal instance = open. To share, set a comma-separated token list here.
+      - ACCESS_TOKENS=${ACCESS_TOKENS:-}
+    ports:
+      - "7000:7000"
