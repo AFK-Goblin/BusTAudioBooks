@@ -48,6 +48,22 @@ TorBox endpoints used (base `https://api.torbox.app/v1/api`):
 - **Tests + CI.** `npm test` runs the parsing/caching/id/quality suite (no
   network); a GitHub Actions workflow runs it on Node 18/20/22.
 
+## 📱 Looking for a better Mobile Experience? 
+
+While Stremio is fantastic for TV screens, its built-in player isn't natively designed for long-form audiobooks on mobile devices (handling things like precise sleep timers, background lock-screen controls, or offline downloads). 
+
+If you plan to listen on your phone, it is highly recommended to use the **BusTAudioBooks Mobile App** instead!
+
+### Why use the Companion App?
+*   📥 **True Offline Downloads:** Native background downloading that survives screen-locks and app kills so you can listen completely offline.
+*   🎧 **Dedicated Audiobook Player:** Built-in chapter menus, persistent speed controls, custom skip intervals, and bookmarks.
+*   ⏳ **Sleep Timer:** A dedicated sleep timer (by minutes or end-of-chapter) that keeps working perfectly in the background.
+*   🩹 **Self-Healing Streams:** Expired TorBox links are silently re-resolved behind the scenes so your playback never randomly stops mid-sentence.
+*   🔒 **Zero Extra Configuration:** It is completely plug-and-play. You just open the app and paste the exact same Stremio `manifest.json` install link you already generated. 
+
+👉 **Check out the project and download the latest Android APK here:** [BusTAudioBooks Mobile Repository](https://github.com/AFK-Goblin/BusTAudioBooks-App)
+
+
 ### Environment variables
 
 | Var | Purpose |
