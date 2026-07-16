@@ -21,6 +21,17 @@ const NOISE = new RegExp(
   "gi"
 );
 
+// Comic release noise — applied ONLY to comic titles, never audiobooks:
+// "digital" or a bare "V2" are legitimate words in book titles
+// ("Digital Minimalism") and stripping them would break audiobook lookups.
+const COMIC_NOISE = new RegExp(
+  [
+    "cbz", "cb7", "cbt", "digital", "webtoon", "scanlation",
+    "\\bv\\d{1,3}\\b", "\\bc\\d{1,4}(?:-\\d{1,4})?\\b",
+  ].join("|"),
+  "gi"
+);
+
 function stripBrackets(s) {
   return String(s || "")
     .replace(/\[[^\]]*\]/g, " ")
@@ -30,9 +41,10 @@ function stripBrackets(s) {
 
 // ABB/Jackett titles are usually "Title - Author [tags]". Pull them apart so we
 // can query providers precisely.
-function parseNameParts(raw) {
+function parseNameParts(raw, type = "audiobook") {
   let s = stripBrackets(raw);
   s = s.replace(/narrated by.*$/i, " ").replace(NOISE, " ");
+  if (type === "comic") s = s.replace(COMIC_NOISE, " ");
   s = s.replace(/[_]+/g, " ").replace(/\s+/g, " ").trim();
   const parts = s.split(/\s+[-–—:]\s+/).map((x) => x.trim()).filter(Boolean);
   if (parts.length >= 2) {
@@ -98,20 +110,26 @@ async function fromOpenLibrary(title, author) {
 }
 
 // Returns { poster, author } — always resolves, never throws.
-async function enrich(raw) {
-  const key = String(raw || "").toLowerCase().trim();
-  if (!key) return { poster: null, author: null };
+async function enrich(raw, type = "audiobook") {
+  const name = String(raw || "").toLowerCase().trim();
+  if (!name) return { poster: null, author: null };
+  // Type-scoped key: a comic and an audiobook sharing a title must not share
+  // a cached cover (iTunes results differ per type).
+  const key = `${type}:${name}`;
 
   const hit = metaCache.get(key);
   if (hit !== undefined) return hit;
 
-  const { title, author } = parseNameParts(raw);
+  const { title, author } = parseNameParts(raw, type);
   let result = { poster: null, author: author || null };
 
   if (title.length >= 2) {
-    // Query all three in parallel (each guarded), then prefer by quality.
+    // Query providers in parallel (each guarded), then prefer by quality.
+    // iTunes is skipped for comics: its search is pinned to media=audiobook.
     const [it, gb, ol] = await Promise.all([
-      withTimeout(fromItunes(title, author).catch(() => null), 2200, null),
+      type === "comic"
+        ? Promise.resolve(null)
+        : withTimeout(fromItunes(title, author).catch(() => null), 2200, null),
       withTimeout(fromGoogleBooks(title, author).catch(() => null), 2200, null),
       withTimeout(fromOpenLibrary(title, author).catch(() => null), 2200, null),
     ]);

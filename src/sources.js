@@ -24,6 +24,13 @@ const limitAbb = pLimit(5); // at most 5 concurrent ABB fetches
 
 const AUDIOBOOK_CATEGORIES = []; // empty = don't filter; rely on the indexer being audiobook-only
 
+// Torznab 7030 = Books/Comics. Overridable for indexers that file manga/comics
+// elsewhere: COMIC_CATEGORIES="7030,8000" etc.
+const COMIC_CATEGORIES = (process.env.COMIC_CATEGORIES || "7030")
+  .split(",")
+  .map((n) => parseInt(n, 10))
+  .filter((n) => Number.isFinite(n));
+
 // ---------------------------------------------------------------------------
 // Small HTML helpers (dependency-free). For heavier scraping you could swap in
 // `cheerio`, but regex keeps this zero-install and easy to host anywhere.
@@ -67,6 +74,20 @@ function qualityScore(item) {
   else if (/mp3/.test(fmt)) score += 100;
   // Size as a faint tiebreaker (bigger usually = higher bitrate).
   score += Math.min((item.size || 0) / (1024 * 1024), 2000) * 0.1;
+  return Math.round(score);
+}
+
+// Comic equivalent of qualityScore. Bitrate is meaningless here; instead prefer
+// formats the app can actually open (CBZ ≫ CBR — no RAR support on-device),
+// with size as a faint "more pages / higher-res scans" tiebreaker.
+function comicQualityScore(item) {
+  let score = 0;
+  const fmt = (item.format || "").toLowerCase();
+  if (/cbz/.test(fmt)) score += 400;
+  else if (/cb7|cbt/.test(fmt)) score += 250;
+  else if (/pdf/.test(fmt)) score += 150;
+  else if (/cbr/.test(fmt)) score += 50;
+  score += Math.min((item.size || 0) / (1024 * 1024), 4000) * 0.1;
   return Math.round(score);
 }
 
@@ -250,7 +271,14 @@ function parseTitleTags(title) {
   return { format: fmt ? fmt.toUpperCase() : null, bitrate: br ? `${br} kbps` : null };
 }
 
-async function searchJackett(config, query) {
+// Comic release titles carry their format as "(CBZ)" / "[cbr]" / a bare word.
+function parseComicTags(title) {
+  const t = String(title || "");
+  const fmt = (t.match(/[\[(]?\b(CBZ|CBR|CB7|CBT|PDF)\b[\])]?/i) || [])[1];
+  return { format: fmt ? fmt.toUpperCase() : null, bitrate: null };
+}
+
+async function searchJackett(config, query, categories = AUDIOBOOK_CATEGORIES) {
   // Per-user config wins; otherwise fall back to server-wide env vars so a
   // shared instance can provide search without each user configuring Jackett.
   const base = (config.jackettUrl || process.env.JACKETT_URL || "").replace(/\/+$/, "");
@@ -260,7 +288,7 @@ async function searchJackett(config, query) {
   const url = new URL(`${base}/api/v2.0/indexers/all/results`);
   url.searchParams.set("apikey", apiKey);
   url.searchParams.set("Query", query);
-  for (const cat of AUDIOBOOK_CATEGORIES) url.searchParams.append("Category[]", String(cat));
+  for (const cat of categories) url.searchParams.append("Category[]", String(cat));
 
   const res = await fetch(url, { headers: { Accept: "application/json" } });
   if (!res.ok) throw new Error(`Jackett HTTP ${res.status}`);
@@ -293,20 +321,15 @@ async function searchJackett(config, query) {
 // ===========================================================================
 // Combine all sources
 // ===========================================================================
-async function searchAudiobooks(config, query, page = 1) {
-  const results = await Promise.allSettled([
-    searchAudiobookBay(config, query, page),
-    page === 1 ? searchJackett(config, query) : Promise.resolve([]),
-  ]);
-
+// De-duplicate by a stable key (infohash when we have one, else the torrent
+// link), preferring the entry with more seeders / known size.
+function dedupeAndSort(settled) {
   const all = [];
-  for (const r of results) {
+  for (const r of settled) {
     if (r.status === "fulfilled") all.push(...r.value);
     else console.error("source failed:", r.reason && r.reason.message);
   }
 
-  // De-duplicate by a stable key (infohash when we have one, else the torrent
-  // link), preferring the entry with more seeders / known size.
   const byKey = new Map();
   for (const item of all) {
     const key = item.infohash || item.torrentUrl || item.magnet || item.name;
@@ -318,13 +341,35 @@ async function searchAudiobooks(config, query, page = 1) {
   return [...byKey.values()].sort((a, b) => b.seeders - a.seeders);
 }
 
+async function searchAudiobooks(config, query, page = 1) {
+  const results = await Promise.allSettled([
+    searchAudiobookBay(config, query, page),
+    page === 1 ? searchJackett(config, query) : Promise.resolve([]),
+  ]);
+  return dedupeAndSort(results);
+}
+
+// Comics come from Jackett only (ABB is audiobook-only). Same page-1-only rule
+// as the audiobook Jackett path, since Jackett results aren't paginated here.
+async function searchComics(config, query, page = 1) {
+  if (page > 1) return [];
+  const results = await Promise.allSettled([searchJackett(config, query, COMIC_CATEGORIES)]);
+  return dedupeAndSort(results).map((r) => {
+    const tags = parseComicTags(r.name);
+    return { ...r, type: "comic", format: tags.format, bitrate: null };
+  });
+}
+
 module.exports = {
   searchAudiobooks,
+  searchComics,
   qualityScore,
+  comicQualityScore,
   // exported for testing
   _parseAbbList: parseAbbList,
   _parseAbbDetail: parseAbbDetail,
   _buildMagnet: buildMagnet,
   _parseTitleTags: parseTitleTags,
+  _parseComicTags: parseComicTags,
   _searchJackett: searchJackett,
 };

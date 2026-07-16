@@ -13,6 +13,9 @@ function encodeItemId(item) {
       f: item.format || undefined,
       b: item.bitrate || undefined,
       s: item.size || undefined,
+      // Content-type discriminator. Absent = audiobook, so ids minted before
+      // comics existed keep decoding exactly as they always did.
+      t: item.type === "comic" ? "c" : undefined,
     }),
     "utf8"
   ).toString("base64url");
@@ -33,6 +36,7 @@ function decodeItemId(id) {
       format: obj.f,
       bitrate: obj.b,
       size: obj.s,
+      type: obj.t === "c" ? "comic" : "audiobook",
     };
   } catch (_) {
     return null;

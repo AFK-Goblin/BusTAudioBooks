@@ -13,8 +13,12 @@
 
 const http = require("http");
 const https = require("https");
+const { pLimit } = require("./cache");
 
 const API_BASE = "https://api.torbox.app/v1/api";
+
+// Bounded concurrency for per-file requestdl calls in resolveStreams.
+const limitRequestDl = pLimit(6);
 
 const AUDIO_EXTENSIONS = [
   ".mp3", ".m4a", ".m4b", ".m4p", ".flac", ".ogg", ".opus",
@@ -37,6 +41,20 @@ function authHeaders(apiKey) {
 function isAudioFile(name) {
   const lower = (name || "").toLowerCase();
   return AUDIO_EXTENSIONS.some((ext) => lower.endsWith(ext));
+}
+
+// Comic torrents are either page archives (.cbz = zip, .cbr = rar, ...) or a
+// loose folder of page images. Both count — the app reads CBZ/images directly
+// and offers the rest as downloads.
+const COMIC_EXTENSIONS = [".cbz", ".cbr", ".cb7", ".cbt", ".pdf"];
+const IMAGE_EXTENSIONS = [".jpg", ".jpeg", ".png", ".webp", ".avif"];
+
+function isComicFile(name) {
+  const lower = (name || "").toLowerCase();
+  return (
+    COMIC_EXTENSIONS.some((ext) => lower.endsWith(ext)) ||
+    IMAGE_EXTENSIONS.some((ext) => lower.endsWith(ext))
+  );
 }
 
 // Formats the Stremio *web* player can generally handle. Others (m4b, flac, ...)
@@ -260,7 +278,7 @@ function formatBytes(bytes) {
 // Returns { ready: boolean, streams: [...], status: string }
 //   ready === false means TorBox is still downloading an uncached torrent; the
 //   caller should surface a "preparing" message and let the user retry.
-async function resolveStreams(apiKey, { magnet, infohash, name, torrentUrl, instantOnly = false }) {
+async function resolveStreams(apiKey, { magnet, infohash, name, torrentUrl, instantOnly = false, kind = "audio" }) {
   let hash = infohash ? infohash.toLowerCase() : infohashFromMagnet(magnet);
   if (!hash && !magnet && !torrentUrl) {
     throw new Error("No infohash, magnet, or torrent link provided");
@@ -321,36 +339,49 @@ async function resolveStreams(apiKey, { magnet, infohash, name, torrentUrl, inst
     };
   }
 
-  // 3. Build a stream per audio file.
-  const audioFiles = (torrent.files || [])
-    .filter((f) => isAudioFile(f.name || f.short_name))
+  // 3. Build a stream per relevant file (audio files, or comic archives/pages).
+  const wantFile = kind === "comic" ? isComicFile : isAudioFile;
+  const matchedFiles = (torrent.files || [])
+    .filter((f) => wantFile(f.name || f.short_name))
     .sort((a, b) => String(a.name).localeCompare(String(b.name), undefined, { numeric: true }));
 
+  // Request links concurrently (bounded) — a loose-image comic can have
+  // hundreds of page files, and doing these serially would take minutes.
+  const resolved = await Promise.all(
+    matchedFiles.map((file) =>
+      limitRequestDl(async () => {
+        try {
+          return { file, url: await requestDownloadLink(apiKey, torrent.id, file.id) };
+        } catch (err) {
+          // Skip files that fail to resolve, keep the rest.
+          console.error("requestdl failed for file", file.id, err.message);
+          return null;
+        }
+      })()
+    )
+  );
+
   const streams = [];
-  for (const file of audioFiles) {
-    try {
-      const url = await requestDownloadLink(apiKey, torrent.id, file.id);
-      const shortName = (file.short_name || file.name || "").split("/").pop();
-      const size = formatBytes(file.size);
-      streams.push({
-        name: "TorBox",
-        title: size ? `${shortName}\n${size}` : shortName,
-        url,
-        behaviorHints: {
-          bingeGroup: `torbox-${hash}`,
-          filename: shortName,
-          // Browsers can't play m4b/flac/etc.; hint Stremio to use an external player.
-          notWebReady: !webReadyForFile(shortName),
-        },
-      });
-    } catch (err) {
-      // Skip files that fail to resolve, keep the rest.
-      console.error("requestdl failed for file", file.id, err.message);
-    }
+  for (const r of resolved) {
+    if (!r) continue;
+    const shortName = (r.file.short_name || r.file.name || "").split("/").pop();
+    const size = formatBytes(r.file.size);
+    streams.push({
+      name: "TorBox",
+      title: size ? `${shortName}\n${size}` : shortName,
+      url: r.url,
+      behaviorHints: {
+        bingeGroup: `torbox-${hash}`,
+        filename: shortName,
+        // Browsers can't play m4b/flac/etc. (and never comic archives);
+        // hint Stremio to use an external player.
+        notWebReady: kind === "comic" || !webReadyForFile(shortName),
+      },
+    });
   }
 
   if (streams.length === 0) {
-    return { ready: false, streams: [], status: "No audio files found in this torrent." };
+    return { ready: false, streams: [], status: `No ${kind} files found in this torrent.` };
   }
   return { ready: true, streams, status: "ok" };
 }
@@ -358,6 +389,7 @@ async function resolveStreams(apiKey, { magnet, infohash, name, torrentUrl, inst
 module.exports = {
   API_BASE,
   isAudioFile,
+  isComicFile,
   webReadyForFile,
   infohashFromMagnet,
   magnetFromInfohash,

@@ -3,7 +3,7 @@ const express = require("express");
 const crypto = require("crypto");
 const { manifest } = require("./manifest");
 const { decodeConfig } = require("./config");
-const { searchAudiobooks, qualityScore } = require("./sources");
+const { searchAudiobooks, searchComics, qualityScore, comicQualityScore } = require("./sources");
 const { enrich } = require("./metadata");
 const { encodeItemId, decodeItemId } = require("./itemid");
 const { TTLCache, pLimit, withTimeout } = require("./cache");
@@ -19,9 +19,16 @@ const streamCache = new TTLCache(30 * 60 * 1000, 500); // resolved playable stre
 const limitMeta = pLimit(6); // cap concurrent cover-art lookups
 
 // Cache key for resolved streams: hash the API key so it never lands in a key.
-function streamKey(apiKey, infohash) {
+// Includes the content type — the same torrent resolved as "comic" keeps a
+// different file set than as "audiobook".
+function streamKey(apiKey, type, infohash) {
   const kh = crypto.createHash("sha1").update(apiKey).digest("hex").slice(0, 12);
-  return `${kh}:${infohash}`;
+  return `${kh}:${type}:${infohash}`;
+}
+
+// Whitelist the content type; anything unknown falls back to audiobook.
+function typeOf(x) {
+  return x === "comic" ? "comic" : "audiobook";
 }
 
 // Instant-only can be set per-install (config) or globally (env).
@@ -120,6 +127,10 @@ const CONFIGURE_HTML = `<!doctype html>
       <input id="jackettUrl" placeholder="http://localhost:9117"/>
       <label>Indexer API key</label>
       <input id="jackettApiKey" placeholder="Jackett/Prowlarr API key"/>
+      <p style="margin-top:10px;color:#8f859e;font-size:.85rem">
+        📚 Comics search in the mobile app also uses Jackett/Prowlarr
+        (Torznab category 7030) — add an indexer that carries comics to enable it.
+      </p>
     </details>
   </div>
 
@@ -204,16 +215,19 @@ app.get("/:config/manifest.json", (req, res) => {
 // ---- Shared search (used by both the Stremio catalog and the app API) -------
 // Returns enriched result items: the raw source item plus { poster, author,
 // cached }. Cached per query/page so both consumers share the heavy work.
-async function runSearch(cfg, query, page) {
+async function runSearch(cfg, query, page, type = "audiobook") {
   const instantOnly = isInstantOnly(cfg);
   const effJackett = cfg.jackettUrl || process.env.JACKETT_URL || "";
-  const cacheKey = `${cfg.abbDomain || ""}|${effJackett}|${instantOnly ? "I" : ""}|${query}|${page}`;
+  const cacheKey = `${type}|${cfg.abbDomain || ""}|${effJackett}|${instantOnly ? "I" : ""}|${query}|${page}`;
   const hit = searchCache.get(cacheKey);
   if (hit) return hit;
 
   let results = [];
   try {
-    results = await searchAudiobooks(cfg, query, page);
+    results =
+      type === "comic"
+        ? await searchComics(cfg, query, page)
+        : await searchAudiobooks(cfg, query, page);
   } catch (err) {
     console.error("search error:", err.message);
   }
@@ -233,8 +247,9 @@ async function runSearch(cfg, query, page) {
     const ca = a.infohash && cachedSet.has(a.infohash) ? 1 : 0;
     const cb = b.infohash && cachedSet.has(b.infohash) ? 1 : 0;
     if (ca !== cb) return cb - ca;
-    const qa = qualityScore(a);
-    const qb = qualityScore(b);
+    const score = type === "comic" ? comicQualityScore : qualityScore;
+    const qa = score(a);
+    const qb = score(b);
     if (qa !== qb) return qb - qa;
     return (b.seeders || 0) - (a.seeders || 0);
   });
@@ -242,7 +257,7 @@ async function runSearch(cfg, query, page) {
   const enriched = await Promise.all(
     results.map((r) =>
       limitMeta(async () => {
-        const meta = await withTimeout(enrich(r.name), 2500, { poster: null, author: null });
+        const meta = await withTimeout(enrich(r.name, type), 2500, { poster: null, author: null });
         return {
           ...r,
           poster: meta.poster || null,
@@ -345,7 +360,8 @@ app.get("/:config/meta/:type/:id.json", async (req, res) => {
 // Returns { ready, status, streams } where streams are raw {title,url,filename,
 // behaviorHints}. Cached per (apiKey, item) so re-opens don't re-hit TorBox.
 async function resolveForItem(cfg, item) {
-  const key = streamKey(cfg.apiKey, item.infohash || item.torrentUrl || item.name);
+  const type = typeOf(item.type);
+  const key = streamKey(cfg.apiKey, type, item.infohash || item.torrentUrl || item.name);
   const cachedStreams = streamCache.get(key);
   if (cachedStreams) return { ready: true, status: "ok", streams: cachedStreams };
 
@@ -355,6 +371,7 @@ async function resolveForItem(cfg, item) {
     torrentUrl: item.torrentUrl,
     name: item.name,
     instantOnly: isInstantOnly(cfg),
+    kind: type === "comic" ? "comic" : "audio",
   });
   if (result.ready) streamCache.set(key, result.streams);
   return result;
@@ -397,18 +414,20 @@ app.get("/:config/stream/:type/:id.json", async (req, res) => {
 // ---- App JSON API (for the native app) --------------------------------------
 // Simple, app-friendly endpoints backed by the same search + TorBox logic.
 
-// GET /:config/app/search?q=...&page=1
+// GET /:config/app/search?q=...&page=1&type=audiobook|comic
 app.get("/:config/app/search", async (req, res) => {
   const cfg = getConfig(req, res);
   if (!cfg) return;
   const query = String(req.query.q || "").trim();
   if (!query) return res.json({ results: [] });
   const page = parseInt(req.query.page, 10) || 1;
+  const type = typeOf(req.query.type);
 
-  const items = await runSearch(cfg, query, page);
+  const items = await runSearch(cfg, query, page, type);
   res.json({
     results: items.map((r) => ({
       id: encodeItemId(r),
+      type,
       title: prettyName(r.name),
       author: r.author || null,
       poster: r.poster || null,
@@ -434,6 +453,7 @@ app.get("/:config/app/streams/:id", async (req, res) => {
       ready: !!result.ready,
       status: result.status || (result.ready ? "ok" : "preparing"),
       title: prettyName(item.name),
+      type: typeOf(item.type),
       format: item.format || null,
       bitrate: item.bitrate || null,
       streams: (result.streams || []).map((s) => ({
@@ -468,12 +488,16 @@ async function handleHealth(req, res) {
   };
   if (cfg && cfg.apiKey) {
     out.torboxKeyValid = await withTimeout(torbox.validateKey(cfg.apiKey), 5000, false);
+    const hasJackett = !!(
+      (cfg.jackettUrl || process.env.JACKETT_URL) &&
+      (cfg.jackettApiKey || process.env.JACKETT_API_KEY)
+    );
     out.sources = {
       audiobookbay: !!(cfg.abbDomain || process.env.ABB_DOMAIN),
-      jackett: !!(
-        (cfg.jackettUrl || process.env.JACKETT_URL) &&
-        (cfg.jackettApiKey || process.env.JACKETT_API_KEY)
-      ),
+      jackett: hasJackett,
+      // Comics search rides on Jackett (Torznab category 7030), so its
+      // availability IS Jackett's availability.
+      comics: hasJackett,
       serverProvided: !!(process.env.JACKETT_URL && process.env.JACKETT_API_KEY) || !!process.env.ABB_DOMAIN,
     };
     out.abbDomain = cfg.abbDomain || process.env.ABB_DOMAIN || null;

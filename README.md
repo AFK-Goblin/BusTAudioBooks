@@ -71,6 +71,25 @@ If you plan to listen on your phone, it is highly recommended to use the **BusTA
 | `PORT` | Listen port (default 7000) |
 | `ABB_DOMAIN` | Default AudiobookBay domain if a user doesn't set one per-install |
 | `INSTANT_ONLY` | Set to `1` to force instant-only for every install on this instance |
+| `COMIC_CATEGORIES` | Torznab categories for the app's Comics search (default `7030`) |
+
+## 📚 Comics (mobile app only)
+
+The [BusTAudioBooks Mobile App](https://github.com/AFK-Goblin/BusTAudioBooks-App)
+also gets a **Comics** tab powered by this same server. It's app-only — nothing
+changes in Stremio.
+
+- **Search** rides on your Jackett/Prowlarr (Torznab category `7030` =
+  Books/Comics), so add an indexer that carries comics/manga to enable it.
+  AudiobookBay is not used for comics.
+- The app API takes `GET /<config>/app/search?q=...&type=comic`; item ids carry
+  the content type, so `/app/streams/<id>` needs no extra parameter.
+- **Resolution** is the same TorBox flow, but filtered to comic files:
+  `.cbz .cbr .cb7 .cbt .pdf` archives plus loose page images
+  (`.jpg .png .webp .avif`).
+- The app reads **CBZ** archives and loose-image torrents in its built-in
+  vertical reader; CBR/PDF are download-only (open them with a reader of your
+  choice).
 
 ## Setup
 
