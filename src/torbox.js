@@ -21,7 +21,7 @@ const API_BASE = "https://api.torbox.app/v1/api";
 const limitRequestDl = pLimit(6);
 
 const AUDIO_EXTENSIONS = [
-  ".mp3", ".m4a", ".m4b", ".m4p", ".flac", ".ogg", ".opus",
+  ".mp3", ".mp4", ".m4a", ".m4b", ".m4p", ".flac", ".ogg", ".opus",
   ".aac", ".wav", ".wma", ".alac", ".aiff", ".ape",
 ];
 
