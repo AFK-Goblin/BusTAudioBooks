@@ -16,6 +16,9 @@ function encodeItemId(item) {
       // Content-type discriminator. Absent = audiobook, so ids minted before
       // comics existed keep decoding exactly as they always did.
       t: item.type === "comic" ? "c" : undefined,
+      // Provider discriminator + MangaDex manga uuid. Absent = torrent.
+      p: item.provider === "mangadex" ? "m" : undefined,
+      d: item.mangaId || undefined,
     }),
     "utf8"
   ).toString("base64url");
@@ -37,6 +40,8 @@ function decodeItemId(id) {
       bitrate: obj.b,
       size: obj.s,
       type: obj.t === "c" ? "comic" : "audiobook",
+      provider: obj.p === "m" ? "mangadex" : "torrent",
+      mangaId: obj.d,
     };
   } catch (_) {
     return null;

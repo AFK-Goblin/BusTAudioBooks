@@ -4,6 +4,7 @@ const crypto = require("crypto");
 const { manifest } = require("./manifest");
 const { decodeConfig } = require("./config");
 const { searchAudiobooks, searchComics, qualityScore, comicQualityScore } = require("./sources");
+const mangadex = require("./mangadex");
 const { enrich } = require("./metadata");
 const { encodeItemId, decodeItemId } = require("./itemid");
 const { TTLCache, pLimit, withTimeout } = require("./cache");
@@ -414,7 +415,7 @@ app.get("/:config/stream/:type/:id.json", async (req, res) => {
 // ---- App JSON API (for the native app) --------------------------------------
 // Simple, app-friendly endpoints backed by the same search + TorBox logic.
 
-// GET /:config/app/search?q=...&page=1&type=audiobook|comic
+// GET /:config/app/search?q=...&page=1&type=audiobook|comic&source=series|torrents
 app.get("/:config/app/search", async (req, res) => {
   const cfg = getConfig(req, res);
   if (!cfg) return;
@@ -422,6 +423,39 @@ app.get("/:config/app/search", async (req, res) => {
   if (!query) return res.json({ results: [] });
   const page = parseInt(req.query.page, 10) || 1;
   const type = typeOf(req.query.type);
+
+  // "Series" = MangaDex (ongoing manga/webtoons, no torrent/TorBox involved).
+  // Default stays "torrents" so pre-2.1 apps get byte-identical behavior.
+  if (type === "comic" && req.query.source === "series") {
+    if (!mangadexEnabled()) {
+      return res.status(503).json({ results: [], error: "Series source disabled on this server" });
+    }
+    try {
+      const series = await mangadex.searchManga(query, page);
+      return res.json({
+        results: series.map((m) => ({
+          id: encodeItemId({ name: m.title, type: "comic", provider: "mangadex", mangaId: m.mangaId }),
+          type: "comic",
+          provider: "mangadex",
+          mangaId: m.mangaId,
+          title: m.title,
+          author: m.author || null,
+          poster: m.poster || null,
+          description: m.description || null,
+          status: m.status || null,
+          year: m.year || null,
+          format: "MangaDex",
+          bitrate: null,
+          size: 0,
+          sizeText: null,
+          cached: false,
+        })),
+      });
+    } catch (err) {
+      console.error("mangadex search error:", err.message);
+      return res.status(502).json({ results: [], error: err.message });
+    }
+  }
 
   const items = await runSearch(cfg, query, page, type);
   res.json({
@@ -440,12 +474,81 @@ app.get("/:config/app/search", async (req, res) => {
   });
 });
 
+// GET /:config/app/chapters/:id?offset=0&limit=100
+// Chapter list for a MangaDex series item. The full English feed is fetched,
+// filtered and deduped server-side (cached 10 min), then sliced — so counts,
+// checkmarks and "next chapter" all see one stable list.
+// The operator kill-switch for the Series source — checked by every MD route
+// AND reported in /health, so disabling it is visible in the app, not silent.
+function mangadexEnabled() {
+  return process.env.MANGADEX_DISABLED !== "1";
+}
+
+app.get("/:config/app/chapters/:id", async (req, res) => {
+  const cfg = getConfig(req, res);
+  if (!cfg) return;
+  if (!mangadexEnabled()) {
+    return res.status(503).json({ chapters: [], error: "Series source disabled on this server" });
+  }
+  const item = decodeItemId(req.params.id);
+  if (!item || item.provider !== "mangadex" || !item.mangaId) {
+    return res.status(400).json({ chapters: [], error: "Not a series item" });
+  }
+  try {
+    const all = await mangadex.getChapterFeed(item.mangaId);
+    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 100, 1), 500);
+    res.json({
+      series: { id: req.params.id, mangaId: item.mangaId, title: item.name },
+      chapters: all.slice(offset, offset + limit),
+      total: all.length,
+      offset,
+      limit,
+      hasMore: offset + limit < all.length,
+    });
+  } catch (err) {
+    console.error("mangadex chapters error:", err.message);
+    res.status(502).json({ chapters: [], error: err.message });
+  }
+});
+
+// GET /:config/app/pages/:chapterId?saver=1&fresh=1
+// Page image URLs for one chapter. baseUrls expire (~15 min); the reader's
+// self-heal passes fresh=1 to bypass the cache and get a live one.
+const MD_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+app.get("/:config/app/pages/:chapterId", async (req, res) => {
+  const cfg = getConfig(req, res);
+  if (!cfg) return;
+  if (!mangadexEnabled()) {
+    return res.status(503).json({ pages: [], error: "Series source disabled on this server" });
+  }
+  const chapterId = String(req.params.chapterId || "");
+  if (!MD_UUID_RE.test(chapterId)) {
+    return res.status(400).json({ pages: [], error: "Bad chapter id" });
+  }
+  try {
+    const saver = req.query.saver === "1";
+    const { pages, pageCount } = await mangadex.getPages(chapterId, {
+      saver,
+      fresh: req.query.fresh === "1",
+    });
+    res.json({ chapterId, pages, pageCount, saver, expiresInSec: 600 });
+  } catch (err) {
+    console.error("mangadex pages error:", err.message);
+    res.status(502).json({ pages: [], error: err.message });
+  }
+});
+
 // GET /:config/app/streams/:id  -> playable files for a book
 app.get("/:config/app/streams/:id", async (req, res) => {
   const cfg = getConfig(req, res);
   if (!cfg) return;
   const item = decodeItemId(req.params.id);
   if (!item) return res.status(400).json({ ready: false, streams: [], status: "Bad item id" });
+  // Series items have no torrent to resolve — never send them to TorBox.
+  if (item.provider === "mangadex") {
+    return res.status(400).json({ ready: false, streams: [], status: "Series item — use /app/chapters" });
+  }
 
   try {
     const result = await resolveForItem(cfg, item);
@@ -498,6 +601,9 @@ async function handleHealth(req, res) {
       // Comics search rides on Jackett (Torznab category 7030), so its
       // availability IS Jackett's availability.
       comics: hasJackett,
+      // The Series source (MangaDex) needs no user config; this key's
+      // presence is the app's capability probe for the Series chip.
+      mangadex: mangadexEnabled(),
       serverProvided: !!(process.env.JACKETT_URL && process.env.JACKETT_API_KEY) || !!process.env.ABB_DOMAIN,
     };
     out.abbDomain = cfg.abbDomain || process.env.ABB_DOMAIN || null;

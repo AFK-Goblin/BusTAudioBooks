@@ -77,7 +77,17 @@ If you plan to listen on your phone, it is highly recommended to use the **BusTA
 
 The [BusTAudioBooks Mobile App](https://github.com/AFK-Goblin/BusTAudioBooks-App)
 also gets a **Comics** tab powered by this same server. It's app-only — nothing
-changes in Stremio.
+changes in Stremio. Two sources:
+
+- **Series (MangaDex)** — ongoing manga/webtoons via MangaDex's official API:
+  `GET /<config>/app/search?q=...&type=comic&source=series`, then
+  `GET /<config>/app/chapters/<id>` and `GET /<config>/app/pages/<chapterId>`
+  (`?saver=1` for data-saver pages, `?fresh=1` to bypass the cache when a page
+  URL expires). No user config needed; the server rate-limits itself well under
+  MangaDex's caps and sends a proper User-Agent. Set `MANGADEX_DISABLED=1` to
+  turn the source off. Licensed series may show few/no chapters — their pages
+  live on the publisher's site; that's what the Torrents source is for.
+- **Torrents (Jackett + TorBox)** — finished/bundled series, as below.
 
 - **Search** rides on your Jackett/Prowlarr (Torznab category `7030` =
   Books/Comics), so add an indexer that carries comics/manga to enable it.
