@@ -1,9 +1,81 @@
 # BusTAudio — Stremio Audiobook Addon
 
 A Stremio addon that searches for audiobooks and resolves **playable / downloadable
-links through your TorBox account**. Each user installs it with their own TorBox
+links through your TorBox or AllDebrid account**. Each user configures it with their own provider
 API key baked into the install URL, so there's no shared server state and no
 database.
+
+## French trackers + AllDebrid (companion app)
+
+The backend now supports direct **C411, Tr4ker, and Torr9** audiobook searches
+and **AllDebrid** playback. Jackett is not required for these sources. Existing
+TorBox install links and the optional Jackett integration continue to work.
+
+1. Run `npm install`, then `npm start` (Node 18 or newer).
+2. Open `http://localhost:7000/configure`.
+3. Select AllDebrid or TorBox and enter that provider's API key.
+4. Enable **French audiobook trackers**, then tick each tracker you use and enter
+   its API key/passkey. Common settings let you prefer MP3/M4B and limit release
+   size independently of your sources. Tracker searches use audiobook category `3030`.
+5. Generate the companion app link and paste it into the app's setup screen.
+
+**Book language:** choose **All languages**, **French only**, or **English only**
+under common settings. The exclusive choices filter audiobook search results on
+the server before the result limit is applied. C411, Tr4ker and Torr9 releases
+default to French when no language is specified. Explicit language fields or
+release tags override that default. AudiobookBay and other sources must provide
+an explicit language field or release tag to pass an exclusive filter; a French
+book title or metadata cover alone is insufficient. Ambiguous multilingual
+releases are excluded. Generate a new install link after changing this setting
+and reconnect the app with that link.
+
+Existing install links using `preferredLanguage` keep their original ordering
+behavior. Without an exclusive filter, French tracker installs still sort French
+releases first. Searches do not translate the user's query.
+
+Metadata searches normalize dotted release names, release years, volume markers
+(such as `T01`), and author initials, and use French catalog settings
+for French books (Apple's France storefront, Google Books' language restriction,
+and Open Library's language preference). Covers, author names, and canonical
+titles depend on catalog matches. Cleaned release titles are used when no match
+is found. The original release name and item ID remain available for resolution.
+Chapter display labels use the MP3 filename without its torrent folder prefix;
+full paths remain in the file identity. Already saved/downloaded app entries may
+retain their previously stored labels until reloaded.
+
+**Testing from a phone:** open the configure page using your computer's LAN
+address, for example `http://192.168.1.20:7000/configure`, and generate the link
+there. The phone and computer must be on the same network, with port 7000
+reachable. `localhost` on a phone refers to the phone, not your computer.
+For remote use, expose this service through HTTPS. `PUBLIC_URL=https://your-host`
+can set the public origin for AllDebrid chapter redirects behind a reverse proxy.
+The computer/server must remain running, including when later chapters start.
+
+**AllDebrid behavior:** searches never upload or delete torrents. Its readiness
+indicator means a book is known ready in your account, not globally cached.
+Some API status responses omit hashes; uploads made through this server are
+remembered in memory for up to 24 hours to associate those IDs with search hashes.
+Leave the ready-only option off initially. Opening a book uploads its original
+`.torrent` (preserving private tracker details), or its magnet, when needed.
+If it is still downloading, reopen it later. All audio files are returned in
+natural filename order, preserving directory names. Individual chapter URLs
+unlock on demand and redirect to AllDebrid; this backend does not relay audio.
+
+Tracker endpoint URLs can be overridden on the configure page. Defaults follow
+current C411/Tr4ker Torznab interfaces and Frenchio's Torr9 adapter. Torr9's legacy
+endpoint and all authenticated tracker access require live validation with your
+account. These integrations do not guarantee tracker availability or inventory.
+AllDebrid may reject some hosting/VPN IPs (`MAGNET_NO_SERVER` / `AUTH_BLOCKED`);
+its API error code is surfaced by the backend.
+
+The generated link contains your provider and tracker credentials: keep it
+private. The companion app source in `others/` is a reference and is not modified
+or bundled with this backend. Its existing health check uses `torboxKeyValid`;
+for compatibility that field reports the selected provider's validity. New clients
+can use `provider` and `providerKeyValid` instead.
+
+Run `npm test` for backend tests, including mocked provider flows and companion
+API integration. Real account downloads and device playback require manual testing.
 
 ## How it works
 
@@ -69,7 +141,7 @@ If you plan to listen on your phone, it is highly recommended to use the **BusTA
 | Var | Purpose |
 |-----|---------|
 | `PORT` | Listen port (default 7000) |
-| `ABB_DOMAIN` | Default AudiobookBay domain if a user doesn't set one per-install |
+| `ABB_DOMAIN` | Override the built-in `audiobookbay.lu` default; per-install overrides take priority |
 | `INSTANT_ONLY` | Set to `1` to force instant-only for every install on this instance |
 | `COMIC_CATEGORIES` | Torznab categories for the app's Comics search (default `7030`) |
 

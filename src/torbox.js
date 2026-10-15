@@ -180,6 +180,7 @@ function fetchTorrentSource(url, maxHops = 6) {
         return reject(new Error("bad torrent URL"));
       }
       if (parsed.protocol === "magnet:") return resolve({ magnet: u });
+      if (!["http:", "https:"].includes(parsed.protocol)) return reject(new Error("Invalid torrent URL protocol"));
       const lib = parsed.protocol === "https:" ? https : http;
       const req = lib.get(u, (res) => {
         const { statusCode, headers } = res;
@@ -194,7 +195,13 @@ function fetchTorrentSource(url, maxHops = 6) {
           return reject(new Error(`torrent download failed (HTTP ${statusCode})`));
         }
         const chunks = [];
-        res.on("data", (c) => chunks.push(c));
+        let bytes = 0;
+        res.on("data", (c) => {
+          bytes += c.length;
+          if (bytes > 10 * 1024 * 1024) { req.destroy(new Error("Torrent file too large")); return; }
+          chunks.push(c);
+        });
+        res.on("error", reject);
         res.on("end", () => resolve({ buffer: Buffer.concat(chunks) }));
       });
       req.on("error", reject);
@@ -283,7 +290,7 @@ async function resolveStreams(apiKey, { magnet, infohash, name, torrentUrl, inst
   if (!hash && !magnet && !torrentUrl) {
     throw new Error("No infohash, magnet, or torrent link provided");
   }
-  if (!magnet && hash) magnet = magnetFromInfohash(hash, name);
+  if (!magnet && hash && !torrentUrl) magnet = magnetFromInfohash(hash, name);
 
   // 1. Is it already in the user's account? (Only checkable if we know the hash.)
   let torrent = hash ? await findTorrentByHash(apiKey, hash) : null;
@@ -298,11 +305,11 @@ async function resolveStreams(apiKey, { magnet, infohash, name, torrentUrl, inst
     }
   }
 
-  // 2. If not, add it. Prefer a magnet; otherwise upload the .torrent from the
-  //    indexer's download link. (Cached = near-instant; uncached = TorBox pulls it.)
+  // 2. Prefer the original torrent download to preserve private tracker details.
+  //    Otherwise use the supplied magnet or a hash-based public magnet. (Cached = near-instant; uncached = TorBox pulls it.)
   if (!torrent) {
     let added;
-    if (magnet) {
+    if (magnet && !torrentUrl) {
       added = await createTorrent(apiKey, magnet, { addOnlyIfCached: instantOnly });
     } else {
       added = await createTorrentFromUrl(apiKey, torrentUrl, { addOnlyIfCached: instantOnly });
@@ -387,6 +394,8 @@ async function resolveStreams(apiKey, { magnet, infohash, name, torrentUrl, inst
 }
 
 module.exports = {
+  name: "TorBox", url: "https://torbox.app/", cacheScope: "global",
+  fetchTorrentSource,
   API_BASE,
   isAudioFile,
   isComicFile,

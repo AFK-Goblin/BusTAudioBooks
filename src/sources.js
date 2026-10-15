@@ -10,6 +10,7 @@
 //
 // `searchAudiobooks(config, query)` is the only function index.js calls.
 
+const french = require("./french-trackers");
 const { TTLCache, pLimit, withRetry } = require("./cache");
 
 const BROWSER_UA =
@@ -98,7 +99,7 @@ function comicQualityScore(item) {
 // configurable (per-user in the configure page, or via the ABB_DOMAIN env var)
 // so you can point at the current working one without editing code.
 function abbDomain(config) {
-  const raw = (config.abbDomain || process.env.ABB_DOMAIN || "").trim();
+  const raw = (config.abbDomain || process.env.ABB_DOMAIN || "audiobookbay.lu").trim();
   if (!raw) return null;
   return raw.replace(/^https?:\/\//, "").replace(/\/+$/, "");
 }
@@ -201,10 +202,11 @@ function parseAbbDetail(html) {
   }
 
   const format = grabField(html, "Format");
+  const language = grabField(html, "Language");
   let bitrate = grabField(html, "Bitrate");
   if (bitrate && !/kbps/i.test(bitrate)) bitrate = bitrate.replace(/\s+/g, " ").trim();
 
-  return { infohash, trackers: [...new Set(trackers)], size, format, bitrate };
+  return { infohash, trackers: [...new Set(trackers)], size, format, bitrate, language };
 }
 
 function buildMagnet(infohash, trackers, name) {
@@ -233,7 +235,7 @@ async function searchAudiobookBay(config, query, page = 1) {
   const settled = await Promise.allSettled(
     posts.map(async (p) => {
       const detailHtml = await abbFetch(p.detailUrl, detailCache);
-      const { infohash, trackers, size, format, bitrate } = parseAbbDetail(detailHtml);
+      const { infohash, trackers, size, format, bitrate, language } = parseAbbDetail(detailHtml);
       if (!infohash) return null;
       return {
         name: p.title,
@@ -242,6 +244,7 @@ async function searchAudiobookBay(config, query, page = 1) {
         size,
         seeders: 0, // ABB doesn't expose live seeder counts
         tracker: "AudiobookBay",
+        language,
         format: format || null,
         bitrate: bitrate || null,
       };
@@ -311,6 +314,7 @@ async function searchJackett(config, query, categories = AUDIOBOOK_CATEGORIES) {
         size: typeof r.Size === "number" ? r.Size : 0,
         seeders: typeof r.Seeders === "number" ? r.Seeders : 0,
         tracker: r.Tracker || r.TrackerId || "",
+        language: r.Language || null,
         format: tags.format,
         bitrate: tags.bitrate,
       };
@@ -345,8 +349,9 @@ async function searchAudiobooks(config, query, page = 1) {
   const results = await Promise.allSettled([
     searchAudiobookBay(config, query, page),
     page === 1 ? searchJackett(config, query) : Promise.resolve([]),
+    ...french.searches(config, query, page),
   ]);
-  return dedupeAndSort(results);
+  return dedupeAndSort(results).map(r => ({ ...r, ...(!r.format ? parseTitleTags(r.name) : {}) }));
 }
 
 // Comics come from Jackett only (ABB is audiobook-only). Same page-1-only rule
@@ -361,6 +366,7 @@ async function searchComics(config, query, page = 1) {
 }
 
 module.exports = {
+  abbDomain,
   searchAudiobooks,
   searchComics,
   qualityScore,
