@@ -41,10 +41,17 @@ TorBox endpoints used (base `https://api.torbox.app/v1/api`):
 - **Fast + resilient.** Search pages, detail pages, cover lookups, cache-status
   checks, and resolved playable streams are all memoized with TTLs; outbound
   requests are concurrency-limited; and scrapes retry with backoff. Re-opening a
-  book serves cached links instantly without re-hitting the API.
+  book serves cached links instantly without re-hitting the API. Cover lookups
+  try iTunes first and only fall back to Google Books / Open Library on a miss,
+  and a search never waits more than 3 s for covers — slower lookups finish in
+  the background and are cached for the next search.
 - **Search pagination** (Stremio's infinite scroll / `skip`).
 - **Health route:** `GET /<config>/health` reports whether your TorBox key is
-  valid, which sources are configured, and whether instant-only is on.
+  valid, which sources are configured, and whether instant-only is on. When
+  `ACCESS_TOKENS` is set it answers **403** for a link with a missing or wrong
+  token (as every other route does), so the app rejects a bad link at setup
+  instead of connecting and then failing every search. The bare `GET /health`
+  stays open as a liveness probe.
 - **Tests + CI.** `npm test` runs the parsing/caching/id/quality suite (no
   network); a GitHub Actions workflow runs it on Node 18/20/22.
 
@@ -56,8 +63,8 @@ If you plan to listen on your phone, it is highly recommended to use the **BusTA
 
 ### Why use the Companion App?
 *   📥 **True Offline Downloads:** Native background downloading that survives screen-locks and app kills so you can listen completely offline.
-*   🎧 **Dedicated Audiobook Player:** Built-in chapter menus, persistent speed controls, custom skip intervals, and bookmarks.
-*   ⏳ **Sleep Timer:** A dedicated sleep timer (by minutes or end-of-chapter) that keeps working perfectly in the background.
+*   🎧 **Dedicated Audiobook Player:** Real chapters from single-file M4B books (titles on the lock screen too), whole-book time left, fine-grained speed control, smart rewind, custom skip intervals, and bookmarks.
+*   ⏳ **Sleep Timer:** By minutes, end of chapter, or end of part — with an optional fade-out — and it keeps working in the background.
 *   🩹 **Self-Healing Streams:** Expired TorBox links are silently re-resolved behind the scenes so your playback never randomly stops mid-sentence.
 *   🔒 **Zero Extra Configuration:** It is completely plug-and-play. You just open the app and paste the exact same Stremio `manifest.json` install link you already generated. 
 
@@ -71,35 +78,37 @@ If you plan to listen on your phone, it is highly recommended to use the **BusTA
 | `PORT` | Listen port (default 7000) |
 | `ABB_DOMAIN` | Default AudiobookBay domain if a user doesn't set one per-install |
 | `INSTANT_ONLY` | Set to `1` to force instant-only for every install on this instance |
-| `COMIC_CATEGORIES` | Torznab categories for the app's Comics search (default `7030`) |
 
-## 📚 Comics (mobile app only)
+## 📱 Mobile app API
 
 The [BusTAudioBooks Mobile App](https://github.com/AFK-Goblin/BusTAudioBooks-App)
-also gets a **Comics** tab powered by this same server. It's app-only — nothing
-changes in Stremio. Two sources:
+talks to `/<config>/app/*` on this same server:
 
-- **Series (MangaDex)** — ongoing manga/webtoons via MangaDex's official API:
-  `GET /<config>/app/search?q=...&type=comic&source=series`, then
-  `GET /<config>/app/chapters/<id>` and `GET /<config>/app/pages/<chapterId>`
-  (`?saver=1` for data-saver pages, `?fresh=1` to bypass the cache when a page
-  URL expires). No user config needed; the server rate-limits itself well under
-  MangaDex's caps and sends a proper User-Agent. Set `MANGADEX_DISABLED=1` to
-  turn the source off. Licensed series may show few/no chapters — their pages
-  live on the publisher's site; that's what the Torrents source is for.
-- **Torrents (Jackett + TorBox)** — finished/bundled series, as below.
+- `GET /<config>/app/search?q=...&page=N` — audiobook search. Answers 503 with
+  `{ results: [], error }` when no search source is configured or every source
+  failed (e.g. AudiobookBay behind a Cloudflare challenge), so the app can say
+  why instead of showing "No results". Failures are never cached. Jackett
+  requests time out after 15 s.
+- `GET /<config>/app/streams/<id>` — playable files. Each entry carries `size`
+  (bytes, or `null` when TorBox doesn't report one), which the app uses to
+  estimate whole-book length for multi-part audiobooks; Stremio streams carry
+  the same number as the standard `behaviorHints.videoSize`.
+- `GET /<config>/app/details/<id>` — synopsis, genre and year for the book page
+  (iTunes, then Google Books; only used when the matched title really is this
+  book; cached a day).
+- `GET /<config>/app/series/<id>` — the book's series in order and the next book
+  (Audible's public catalogue, no key needed; `{ series: null }` for standalone
+  books or no match; cached a day). Powers the app's "Next in series".
+- `GET /<config>/app/similar/<id>` — "Because you listened to…": books Audible's
+  listeners also enjoyed plus the author's other books, outside this book's own
+  series, one per other series (`{ similar: null }` when nothing matches; cached a day).
+- `GET /<config>/app/version` — latest APK info for the in-app update prompt:
+  `APP_LATEST_VERSION` + `APP_APK_URL` if set, otherwise the latest release of
+  the app's GitHub repo with an `.apk` attached (`APP_RELEASES_REPO` picks
+  another repo, `none` turns it off; cached an hour).
 
-- **Search** rides on your Jackett/Prowlarr (Torznab category `7030` =
-  Books/Comics), so add an indexer that carries comics/manga to enable it.
-  AudiobookBay is not used for comics.
-- The app API takes `GET /<config>/app/search?q=...&type=comic`; item ids carry
-  the content type, so `/app/streams/<id>` needs no extra parameter.
-- **Resolution** is the same TorBox flow, but filtered to comic files:
-  `.cbz .cbr .cb7 .cbt .pdf` archives plus loose page images
-  (`.jpg .png .webp .avif`).
-- The app reads **CBZ** archives and loose-image torrents in its built-in
-  vertical reader; CBR/PDF are download-only (open them with a reader of your
-  choice).
+Comics were removed in 3.0. App versions that still show a Comics tab get
+HTTP 410 with "Comics were removed…" from the old comic routes.
 
 ## Setup
 
@@ -186,6 +195,7 @@ items.
 | `src/torbox.js` | TorBox API client + `resolveStreams()` flow + batch cache checks |
 | `src/sources.js` | Search sources: AudiobookBay scraper (default) + optional Jackett |
 | `src/metadata.js` | Cover art + author enrichment via Open Library (cached) |
+| `src/series.js` | Series lookup (Audible catalogue) for "Next in series" |
 | `src/cache.js` | TTL/LRU cache, concurrency limiter, timeout helper |
 | `src/itemid.js` | Encode/decode the payload carried in item ids |
 | `src/manifest.js` | Addon manifest (custom `audiobook` type, search catalog) |

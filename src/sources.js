@@ -24,12 +24,6 @@ const limitAbb = pLimit(5); // at most 5 concurrent ABB fetches
 
 const AUDIOBOOK_CATEGORIES = []; // empty = don't filter; rely on the indexer being audiobook-only
 
-// Torznab 7030 = Books/Comics. Overridable for indexers that file manga/comics
-// elsewhere: COMIC_CATEGORIES="7030,8000" etc.
-const COMIC_CATEGORIES = (process.env.COMIC_CATEGORIES || "7030")
-  .split(",")
-  .map((n) => parseInt(n, 10))
-  .filter((n) => Number.isFinite(n));
 
 // ---------------------------------------------------------------------------
 // Small HTML helpers (dependency-free). For heavier scraping you could swap in
@@ -74,20 +68,6 @@ function qualityScore(item) {
   else if (/mp3/.test(fmt)) score += 100;
   // Size as a faint tiebreaker (bigger usually = higher bitrate).
   score += Math.min((item.size || 0) / (1024 * 1024), 2000) * 0.1;
-  return Math.round(score);
-}
-
-// Comic equivalent of qualityScore. Bitrate is meaningless here; instead prefer
-// formats the app can actually open (CBZ ≫ CBR — no RAR support on-device),
-// with size as a faint "more pages / higher-res scans" tiebreaker.
-function comicQualityScore(item) {
-  let score = 0;
-  const fmt = (item.format || "").toLowerCase();
-  if (/cbz/.test(fmt)) score += 400;
-  else if (/cb7|cbt/.test(fmt)) score += 250;
-  else if (/pdf/.test(fmt)) score += 150;
-  else if (/cbr/.test(fmt)) score += 50;
-  score += Math.min((item.size || 0) / (1024 * 1024), 4000) * 0.1;
   return Math.round(score);
 }
 
@@ -220,13 +200,9 @@ async function searchAudiobookBay(config, query, page = 1) {
 
   const pagePath = page > 1 ? `/page/${page}` : "";
   const listUrl = `https://${domain}${pagePath}/?s=${encodeURIComponent(query)}`;
-  let listHtml;
-  try {
-    listHtml = await abbFetch(listUrl, listCache);
-  } catch (err) {
-    console.error("ABB list fetch failed:", err.message);
-    return [];
-  }
+  // A failed list fetch is an error, not "no results": the caller reports it
+  // (e.g. a Cloudflare challenge) instead of caching an empty answer.
+  const listHtml = await abbFetch(listUrl, listCache);
 
   const posts = parseAbbList(listHtml, domain).slice(0, 12); // cap detail fetches
 
@@ -271,26 +247,28 @@ function parseTitleTags(title) {
   return { format: fmt ? fmt.toUpperCase() : null, bitrate: br ? `${br} kbps` : null };
 }
 
-// Comic release titles carry their format as "(CBZ)" / "[cbr]" / a bare word.
-function parseComicTags(title) {
-  const t = String(title || "");
-  const fmt = (t.match(/[\[(]?\b(CBZ|CBR|CB7|CBT|PDF)\b[\])]?/i) || [])[1];
-  return { format: fmt ? fmt.toUpperCase() : null, bitrate: null };
-}
-
-async function searchJackett(config, query, categories = AUDIOBOOK_CATEGORIES) {
-  // Per-user config wins; otherwise fall back to server-wide env vars so a
-  // shared instance can provide search without each user configuring Jackett.
+// Per-user config wins; otherwise fall back to server-wide env vars so a
+// shared instance can provide search without each user configuring Jackett.
+function jackettSettings(config) {
   const base = (config.jackettUrl || process.env.JACKETT_URL || "").replace(/\/+$/, "");
   const apiKey = config.jackettApiKey || process.env.JACKETT_API_KEY || "";
-  if (!base || !apiKey) return [];
+  return base && apiKey ? { base, apiKey } : null;
+}
+
+const JACKETT_TIMEOUT_MS = 15_000;
+
+async function searchJackett(config, query, categories = AUDIOBOOK_CATEGORIES) {
+  const settings = jackettSettings(config);
+  if (!settings) return [];
+  const { base, apiKey } = settings;
 
   const url = new URL(`${base}/api/v2.0/indexers/all/results`);
   url.searchParams.set("apikey", apiKey);
   url.searchParams.set("Query", query);
   for (const cat of categories) url.searchParams.append("Category[]", String(cat));
 
-  const res = await fetch(url, { headers: { Accept: "application/json" } });
+  // A hung indexer must not hold every search open until the client gives up.
+  const res = await fetch(url, { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(JACKETT_TIMEOUT_MS) });
   if (!res.ok) throw new Error(`Jackett HTTP ${res.status}`);
   const json = await res.json();
   const results = Array.isArray(json.Results) ? json.Results : [];
@@ -323,13 +301,7 @@ async function searchJackett(config, query, categories = AUDIOBOOK_CATEGORIES) {
 // ===========================================================================
 // De-duplicate by a stable key (infohash when we have one, else the torrent
 // link), preferring the entry with more seeders / known size.
-function dedupeAndSort(settled) {
-  const all = [];
-  for (const r of settled) {
-    if (r.status === "fulfilled") all.push(...r.value);
-    else console.error("source failed:", r.reason && r.reason.message);
-  }
-
+function dedupeAndSort(all) {
   const byKey = new Map();
   for (const item of all) {
     const key = item.infohash || item.torrentUrl || item.magnet || item.name;
@@ -341,35 +313,60 @@ function dedupeAndSort(settled) {
   return [...byKey.values()].sort((a, b) => b.seeders - a.seeders);
 }
 
-async function searchAudiobooks(config, query, page = 1) {
-  const results = await Promise.allSettled([
-    searchAudiobookBay(config, query, page),
-    page === 1 ? searchJackett(config, query) : Promise.resolve([]),
-  ]);
-  return dedupeAndSort(results);
+// Thrown when search can't run at all: nothing configured, or every source
+// failed. Callers must not cache it, and the app shows its message.
+class SearchUnavailableError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "SearchUnavailableError";
+  }
 }
 
-// Comics come from Jackett only (ABB is audiobook-only). Same page-1-only rule
-// as the audiobook Jackett path, since Jackett results aren't paginated here.
-async function searchComics(config, query, page = 1) {
-  if (page > 1) return [];
-  const results = await Promise.allSettled([searchJackett(config, query, COMIC_CATEGORIES)]);
-  return dedupeAndSort(results).map((r) => {
-    const tags = parseComicTags(r.name);
-    return { ...r, type: "comic", format: tags.format, bitrate: null };
+// Runs the named sources together. Returns { items, partial }; throws when
+// every source failed (an outage must not look like "no results").
+async function runSources(sources) {
+  const settled = await Promise.allSettled(sources.map(([, run]) => run()));
+  const items = [];
+  const failures = [];
+  settled.forEach((r, i) => {
+    if (r.status === "fulfilled") items.push(...r.value);
+    else {
+      const reason = (r.reason && r.reason.message) || "failed";
+      console.error(`${sources[i][0]} search failed:`, reason);
+      failures.push(`${sources[i][0]}: ${reason}`);
+    }
   });
+  if (failures.length > 0 && failures.length === sources.length) {
+    throw new SearchUnavailableError(`Search is unavailable right now — ${failures.join("; ")}`);
+  }
+  return { items: dedupeAndSort(items), partial: failures.length > 0 };
 }
+
+// Result arrays carry `partial: true` when some (not all) sources failed, so
+// the caller can cache them only briefly.
+async function searchAudiobooks(config, query, page = 1) {
+  const abb = !!abbDomain(config);
+  const jackett = !!jackettSettings(config);
+  if (!abb && !jackett) {
+    throw new SearchUnavailableError("No search source is set up — add an AudiobookBay domain or Jackett/Prowlarr on the configure page.");
+  }
+  const sources = [];
+  if (abb) sources.push(["AudiobookBay", () => searchAudiobookBay(config, query, page)]);
+  if (jackett && page === 1) sources.push(["Jackett", () => searchJackett(config, query)]);
+  if (sources.length === 0) return []; // Jackett-only results aren't paginated
+  const { items, partial } = await runSources(sources);
+  return Object.assign(items, { partial });
+}
+
 
 module.exports = {
   searchAudiobooks,
-  searchComics,
+  SearchUnavailableError,
   qualityScore,
-  comicQualityScore,
   // exported for testing
   _parseAbbList: parseAbbList,
   _parseAbbDetail: parseAbbDetail,
   _buildMagnet: buildMagnet,
   _parseTitleTags: parseTitleTags,
-  _parseComicTags: parseComicTags,
   _searchJackett: searchJackett,
 };

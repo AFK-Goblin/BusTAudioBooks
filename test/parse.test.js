@@ -167,36 +167,18 @@ test("item id works for hashless (torrent-link-only) items", () => {
   assert.equal(back.torrentUrl, item.torrentUrl);
 });
 
-test("item id carries the content type; absent type = audiobook (backward compat)", () => {
-  const comic = decodeItemId(encodeItemId({ name: "Solo Leveling v01", type: "comic" }));
-  assert.equal(comic.type, "comic");
-
-  // Ids minted by older builds (no `t` key) must decode as audiobooks.
-  const oldId = decodeItemId(encodeItemId({ name: "Dune - Frank Herbert" }));
-  assert.equal(oldId.type, "audiobook");
-  const handBuilt =
-    "tbab:" + Buffer.from(JSON.stringify({ n: "Legacy Book" }), "utf8").toString("base64url");
-  assert.equal(decodeItemId(handBuilt).type, "audiobook");
+test("ids minted for comics by pre-3.0 servers are recognised as such", () => {
+  const legacy = (payload) => "tbab:" + Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+  assert.equal(decodeItemId(legacy({ n: "Solo Leveling v01", t: "c" })).legacyComic, true);
+  assert.equal(decodeItemId(legacy({ n: "One Piece", p: "m", d: "uuid" })).legacyComic, true);
+  assert.equal(decodeItemId(legacy({ n: "Legacy Book" })).legacyComic, false);
+  // New ids carry no comic markers at all.
+  const fresh = JSON.parse(Buffer.from(encodeItemId({ name: "Dune", type: "comic" }).slice(5), "base64url").toString("utf8"));
+  assert.deepEqual(Object.keys(fresh), ["n"]);
 });
 
-test("comic noise stripping never touches audiobook titles", () => {
-  // "digital" / bare "V2" are real words in book titles — only comics strip them.
-  const audio = parseNameParts("Digital Minimalism - Cal Newport");
-  assert.equal(audio.title, "Digital Minimalism");
-  const comic = parseNameParts("Solo Leveling v01 Digital CBZ", "comic");
-  assert.equal(comic.title, "Solo Leveling");
-});
-
-test("parseComicTags pulls archive format from comic release titles", () => {
-  assert.deepEqual(sources._parseComicTags("Solo Leveling v01 (2021) (Digital) (CBZ)"), {
-    format: "CBZ",
-    bitrate: null,
-  });
-  assert.deepEqual(sources._parseComicTags("One Piece c1001 [cbr]"), {
-    format: "CBR",
-    bitrate: null,
-  });
-  assert.deepEqual(sources._parseComicTags("No tags here"), { format: null, bitrate: null });
+test("book titles keep words comics used to strip", () => {
+  assert.equal(parseNameParts("Digital Minimalism - Cal Newport").title, "Digital Minimalism");
 });
 
 test("parseTitleTags pulls format + bitrate from ABB-style titles", () => {
@@ -222,15 +204,6 @@ test("torbox helpers: infohash parsing, magnet rebuild, audio detection, bytes",
   assert.equal(tb.formatBytes(1536), "1.5 KB");
 });
 
-test("isComicFile: archives and page images yes, audio/junk no", () => {
-  assert.equal(tb.isComicFile("Solo Leveling v01.cbz"), true);
-  assert.equal(tb.isComicFile("volume2.CBR"), true);
-  assert.equal(tb.isComicFile("pages/001.webp"), true);
-  assert.equal(tb.isComicFile("page_010.jpg"), true);
-  assert.equal(tb.isComicFile("book.m4b"), false);
-  assert.equal(tb.isComicFile("info.nfo"), false);
-});
-
 test("webReadyForFile: browser-playable vs external-only formats", () => {
   assert.equal(tb.webReadyForFile("part1.mp3"), true);
   assert.equal(tb.webReadyForFile("part1.m4a"), true);
@@ -244,16 +217,6 @@ test("qualityScore ranks higher bitrate / better container above worse ones", ()
   assert.ok(hi > lo, `expected ${hi} > ${lo}`);
   // Missing fields shouldn't throw and should score low.
   assert.equal(typeof sources.qualityScore({}), "number");
-});
-
-test("comicQualityScore prefers CBZ over CBR, then size", () => {
-  const size = 300 * 1024 * 1024;
-  const cbz = sources.comicQualityScore({ format: "CBZ", size });
-  const cbr = sources.comicQualityScore({ format: "CBR", size });
-  assert.ok(cbz > cbr, `expected ${cbz} > ${cbr}`);
-  const bigCbz = sources.comicQualityScore({ format: "CBZ", size: size * 2 });
-  assert.ok(bigCbz > cbz, `expected ${bigCbz} > ${cbz}`);
-  assert.equal(typeof sources.comicQualityScore({}), "number");
 });
 
 test("access gate: disabled when no tokens configured", () => {

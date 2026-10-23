@@ -3,9 +3,10 @@ const express = require("express");
 const crypto = require("crypto");
 const { manifest } = require("./manifest");
 const { decodeConfig } = require("./config");
-const { searchAudiobooks, searchComics, qualityScore, comicQualityScore } = require("./sources");
-const mangadex = require("./mangadex");
-const { enrich } = require("./metadata");
+const { searchAudiobooks, qualityScore } = require("./sources");
+const { enrich, details, parseNameParts } = require("./metadata");
+const { seriesFor, similarFor } = require("./series");
+const { appRelease } = require("./appRelease");
 const { encodeItemId, decodeItemId } = require("./itemid");
 const { TTLCache, pLimit, withTimeout } = require("./cache");
 const { makeAccess } = require("./access");
@@ -18,18 +19,21 @@ const access = makeAccess(); // shared-token gate (off unless ACCESS_TOKENS set)
 const searchCache = new TTLCache(5 * 60 * 1000, 200); // resolved catalog results
 const streamCache = new TTLCache(30 * 60 * 1000, 500); // resolved playable streams
 const limitMeta = pLimit(6); // cap concurrent cover-art lookups
+// A search waits this long for covers at most; lookups still running carry on
+// in the background and land in the 24 h metadata cache for the next search.
+const ENRICH_BUDGET_MS = 3000;
 
 // Cache key for resolved streams: hash the API key so it never lands in a key.
-// Includes the content type — the same torrent resolved as "comic" keeps a
-// different file set than as "audiobook".
-function streamKey(apiKey, type, infohash) {
+function streamKey(apiKey, itemKey) {
   const kh = crypto.createHash("sha1").update(apiKey).digest("hex").slice(0, 12);
-  return `${kh}:${type}:${infohash}`;
+  return `${kh}:${itemKey}`;
 }
 
-// Whitelist the content type; anything unknown falls back to audiobook.
-function typeOf(x) {
-  return x === "comic" ? "comic" : "audiobook";
+// Comics were removed in 3.0. App versions that still have a Comics tab get
+// this instead of audiobook results showing up under it.
+const COMICS_REMOVED = "Comics were removed from BusTAudio. Update the app to the latest version.";
+function comicsGone(res, body = {}) {
+  return res.status(410).json({ ...body, error: COMICS_REMOVED });
 }
 
 // Instant-only can be set per-install (config) or globally (env).
@@ -128,10 +132,6 @@ const CONFIGURE_HTML = `<!doctype html>
       <input id="jackettUrl" placeholder="http://localhost:9117"/>
       <label>Indexer API key</label>
       <input id="jackettApiKey" placeholder="Jackett/Prowlarr API key"/>
-      <p style="margin-top:10px;color:#8f859e;font-size:.85rem">
-        📚 Comics search in the mobile app also uses Jackett/Prowlarr
-        (Torznab category 7030) — add an indexer that carries comics to enable it.
-      </p>
     </details>
   </div>
 
@@ -216,22 +216,19 @@ app.get("/:config/manifest.json", (req, res) => {
 // ---- Shared search (used by both the Stremio catalog and the app API) -------
 // Returns enriched result items: the raw source item plus { poster, author,
 // cached }. Cached per query/page so both consumers share the heavy work.
-async function runSearch(cfg, query, page, type = "audiobook") {
+async function runSearch(cfg, query, page) {
   const instantOnly = isInstantOnly(cfg);
   const effJackett = cfg.jackettUrl || process.env.JACKETT_URL || "";
-  const cacheKey = `${type}|${cfg.abbDomain || ""}|${effJackett}|${instantOnly ? "I" : ""}|${query}|${page}`;
+  const cacheKey = `${cfg.abbDomain || ""}|${effJackett}|${instantOnly ? "I" : ""}|${query}|${page}`;
+  // The cache holds the expensive part (sources + TorBox cache check) without
+  // covers; covers come from their own cache on every call.
   const hit = searchCache.get(cacheKey);
-  if (hit) return hit;
+  if (hit) return enrichWithin(hit, ENRICH_BUDGET_MS);
 
-  let results = [];
-  try {
-    results =
-      type === "comic"
-        ? await searchComics(cfg, query, page)
-        : await searchAudiobooks(cfg, query, page);
-  } catch (err) {
-    console.error("search error:", err.message);
-  }
+  // Errors (nothing configured, every source down) propagate uncached; the
+  // app API reports them, the Stremio catalog shows an empty row.
+  let results = await searchAudiobooks(cfg, query, page);
+  const partial = !!results.partial;
   results = results.slice(0, 40);
 
   let cachedSet = new Set();
@@ -248,29 +245,31 @@ async function runSearch(cfg, query, page, type = "audiobook") {
     const ca = a.infohash && cachedSet.has(a.infohash) ? 1 : 0;
     const cb = b.infohash && cachedSet.has(b.infohash) ? 1 : 0;
     if (ca !== cb) return cb - ca;
-    const score = type === "comic" ? comicQualityScore : qualityScore;
-    const qa = score(a);
-    const qb = score(b);
+    const qa = qualityScore(a);
+    const qb = qualityScore(b);
     if (qa !== qb) return qb - qa;
     return (b.seeders || 0) - (a.seeders || 0);
   });
 
-  const enriched = await Promise.all(
-    results.map((r) =>
-      limitMeta(async () => {
-        const meta = await withTimeout(enrich(r.name, type), 2500, { poster: null, author: null });
-        return {
-          ...r,
-          poster: meta.poster || null,
-          author: meta.author || null,
-          cached: !!(r.infohash && cachedSet.has(r.infohash)),
-        };
-      })()
-    )
-  );
+  const found = results.map((r) => ({ ...r, cached: !!(r.infohash && cachedSet.has(r.infohash)) }));
+  // Partial results (one source failed) are kept only briefly.
+  searchCache.set(cacheKey, found, partial ? 30 * 1000 : undefined);
+  return enrichWithin(found, ENRICH_BUDGET_MS);
+}
 
-  searchCache.set(cacheKey, enriched);
-  return enriched;
+// Adds { poster, author } to each result, waiting at most `budgetMs`. Results
+// whose lookup hasn't finished go out with the author parsed from the title
+// and no cover; their lookups keep running and fill the metadata cache.
+async function enrichWithin(items, budgetMs) {
+  const out = items.map((r) => ({ ...r, poster: null, author: parseNameParts(r.name).author || null }));
+  const lookups = items.map((r, i) =>
+    limitMeta(async () => {
+      const meta = await enrich(r.name);
+      out[i] = { ...r, poster: meta.poster || null, author: meta.author || null };
+    })()
+  );
+  await withTimeout(Promise.all(lookups), budgetMs, undefined);
+  return out.slice();
 }
 
 // ---- Catalog (search only) --------------------------------------------------
@@ -294,7 +293,13 @@ async function handleCatalog(req, res, extraRaw) {
   const skip = parseInt(extra.skip, 10) || 0;
   const page = Math.floor(skip / PAGE_SIZE) + 1;
 
-  const items = await runSearch(cfg, query, page);
+  let items;
+  try {
+    items = await runSearch(cfg, query, page);
+  } catch (err) {
+    console.error("catalog search error:", err.message);
+    return res.json({ metas: [] });
+  }
   const metas = items.map((r) => ({
     id: encodeItemId(r),
     type: "audiobook",
@@ -361,8 +366,7 @@ app.get("/:config/meta/:type/:id.json", async (req, res) => {
 // Returns { ready, status, streams } where streams are raw {title,url,filename,
 // behaviorHints}. Cached per (apiKey, item) so re-opens don't re-hit TorBox.
 async function resolveForItem(cfg, item) {
-  const type = typeOf(item.type);
-  const key = streamKey(cfg.apiKey, type, item.infohash || item.torrentUrl || item.name);
+  const key = streamKey(cfg.apiKey, item.infohash || item.torrentUrl || item.name);
   const cachedStreams = streamCache.get(key);
   if (cachedStreams) return { ready: true, status: "ok", streams: cachedStreams };
 
@@ -372,7 +376,6 @@ async function resolveForItem(cfg, item) {
     torrentUrl: item.torrentUrl,
     name: item.name,
     instantOnly: isInstantOnly(cfg),
-    kind: type === "comic" ? "comic" : "audio",
   });
   if (result.ready) streamCache.set(key, result.streams);
   return result;
@@ -415,53 +418,27 @@ app.get("/:config/stream/:type/:id.json", async (req, res) => {
 // ---- App JSON API (for the native app) --------------------------------------
 // Simple, app-friendly endpoints backed by the same search + TorBox logic.
 
-// GET /:config/app/search?q=...&page=1&type=audiobook|comic&source=series|torrents
+// GET /:config/app/search?q=...&page=1
 app.get("/:config/app/search", async (req, res) => {
   const cfg = getConfig(req, res);
   if (!cfg) return;
   const query = String(req.query.q || "").trim();
   if (!query) return res.json({ results: [] });
   const page = parseInt(req.query.page, 10) || 1;
-  const type = typeOf(req.query.type);
+  if (req.query.type === "comic") return comicsGone(res, { results: [] });
 
-  // "Series" = MangaDex (ongoing manga/webtoons, no torrent/TorBox involved).
-  // Default stays "torrents" so pre-2.1 apps get byte-identical behavior.
-  if (type === "comic" && req.query.source === "series") {
-    if (!mangadexEnabled()) {
-      return res.status(503).json({ results: [], error: "Series source disabled on this server" });
-    }
-    try {
-      const series = await mangadex.searchManga(query, page);
-      return res.json({
-        results: series.map((m) => ({
-          id: encodeItemId({ name: m.title, type: "comic", provider: "mangadex", mangaId: m.mangaId }),
-          type: "comic",
-          provider: "mangadex",
-          mangaId: m.mangaId,
-          title: m.title,
-          author: m.author || null,
-          poster: m.poster || null,
-          description: m.description || null,
-          status: m.status || null,
-          year: m.year || null,
-          format: "MangaDex",
-          bitrate: null,
-          size: 0,
-          sizeText: null,
-          cached: false,
-        })),
-      });
-    } catch (err) {
-      console.error("mangadex search error:", err.message);
-      return res.status(502).json({ results: [], error: err.message });
-    }
+  let items;
+  try {
+    items = await runSearch(cfg, query, page);
+  } catch (err) {
+    console.error("app search error:", err.message);
+    const unavailable = err.name === "SearchUnavailableError";
+    return res.status(unavailable ? 503 : 502).json({ results: [], error: unavailable ? err.message : "Search failed on the server" });
   }
-
-  const items = await runSearch(cfg, query, page, type);
   res.json({
     results: items.map((r) => ({
       id: encodeItemId(r),
-      type,
+      type: "audiobook",
       title: prettyName(r.name),
       author: r.author || null,
       poster: r.poster || null,
@@ -474,69 +451,10 @@ app.get("/:config/app/search", async (req, res) => {
   });
 });
 
-// GET /:config/app/chapters/:id?offset=0&limit=100
-// Chapter list for a MangaDex series item. The full English feed is fetched,
-// filtered and deduped server-side (cached 10 min), then sliced — so counts,
-// checkmarks and "next chapter" all see one stable list.
-// The operator kill-switch for the Series source — checked by every MD route
-// AND reported in /health, so disabling it is visible in the app, not silent.
-function mangadexEnabled() {
-  return process.env.MANGADEX_DISABLED !== "1";
-}
-
-app.get("/:config/app/chapters/:id", async (req, res) => {
-  const cfg = getConfig(req, res);
-  if (!cfg) return;
-  if (!mangadexEnabled()) {
-    return res.status(503).json({ chapters: [], error: "Series source disabled on this server" });
-  }
-  const item = decodeItemId(req.params.id);
-  if (!item || item.provider !== "mangadex" || !item.mangaId) {
-    return res.status(400).json({ chapters: [], error: "Not a series item" });
-  }
-  try {
-    const all = await mangadex.getChapterFeed(item.mangaId);
-    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
-    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 100, 1), 500);
-    res.json({
-      series: { id: req.params.id, mangaId: item.mangaId, title: item.name },
-      chapters: all.slice(offset, offset + limit),
-      total: all.length,
-      offset,
-      limit,
-      hasMore: offset + limit < all.length,
-    });
-  } catch (err) {
-    console.error("mangadex chapters error:", err.message);
-    res.status(502).json({ chapters: [], error: err.message });
-  }
-});
-
-// GET /:config/app/pages/:chapterId?saver=1&fresh=1
-// Page image URLs for one chapter. baseUrls expire (~15 min); the reader's
-// self-heal passes fresh=1 to bypass the cache and get a live one.
-const MD_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-app.get("/:config/app/pages/:chapterId", async (req, res) => {
-  const cfg = getConfig(req, res);
-  if (!cfg) return;
-  if (!mangadexEnabled()) {
-    return res.status(503).json({ pages: [], error: "Series source disabled on this server" });
-  }
-  const chapterId = String(req.params.chapterId || "");
-  if (!MD_UUID_RE.test(chapterId)) {
-    return res.status(400).json({ pages: [], error: "Bad chapter id" });
-  }
-  try {
-    const saver = req.query.saver === "1";
-    const { pages, pageCount } = await mangadex.getPages(chapterId, {
-      saver,
-      fresh: req.query.fresh === "1",
-    });
-    res.json({ chapterId, pages, pageCount, saver, expiresInSec: 600 });
-  } catch (err) {
-    console.error("mangadex pages error:", err.message);
-    res.status(502).json({ pages: [], error: err.message });
-  }
+// Comic chapter/page routes of app versions before 3.0.
+app.get(["/:config/app/chapters/:id", "/:config/app/pages/:chapterId"], (req, res) => {
+  if (!getConfig(req, res)) return;
+  comicsGone(res);
 });
 
 // GET /:config/app/streams/:id  -> playable files for a book
@@ -545,10 +463,7 @@ app.get("/:config/app/streams/:id", async (req, res) => {
   if (!cfg) return;
   const item = decodeItemId(req.params.id);
   if (!item) return res.status(400).json({ ready: false, streams: [], status: "Bad item id" });
-  // Series items have no torrent to resolve — never send them to TorBox.
-  if (item.provider === "mangadex") {
-    return res.status(400).json({ ready: false, streams: [], status: "Series item — use /app/chapters" });
-  }
+  if (item.legacyComic) return comicsGone(res, { ready: false, streams: [], status: COMICS_REMOVED });
 
   try {
     const result = await resolveForItem(cfg, item);
@@ -556,13 +471,15 @@ app.get("/:config/app/streams/:id", async (req, res) => {
       ready: !!result.ready,
       status: result.status || (result.ready ? "ok" : "preparing"),
       title: prettyName(item.name),
-      type: typeOf(item.type),
+      type: "audiobook",
       format: item.format || null,
       bitrate: item.bitrate || null,
       streams: (result.streams || []).map((s) => ({
         title: (s.behaviorHints && s.behaviorHints.filename) || s.title || item.name,
         url: s.url,
         filename: (s.behaviorHints && s.behaviorHints.filename) || null,
+        // Bytes; null when TorBox didn't report one. Additive — older apps ignore it.
+        size: (s.behaviorHints && s.behaviorHints.videoSize) || null,
       })),
     });
   } catch (err) {
@@ -571,19 +488,57 @@ app.get("/:config/app/streams/:id", async (req, res) => {
   }
 });
 
-// GET /:config/app/version  -> latest native APK info (for in-app update prompt)
-app.get("/:config/app/version", (req, res) => {
+// GET /:config/app/details/:id -> synopsis, genre and year for the book page.
+// Best-effort and cached; every field may be null.
+app.get("/:config/app/details/:id", async (req, res) => {
   const cfg = getConfig(req, res);
   if (!cfg) return;
-  res.json({
-    latestVersion: process.env.APP_LATEST_VERSION || null,
-    apkUrl: process.env.APP_APK_URL || null,
-    minVersion: process.env.APP_MIN_VERSION || null,
-  });
+  const item = decodeItemId(req.params.id);
+  if (!item) return res.status(400).json({ error: "Bad item id" });
+  if (item.legacyComic) return comicsGone(res);
+  res.json({ title: prettyName(item.name), ...(await details(item.name)) });
+});
+
+// GET /:config/app/series/:id -> { series: { name, position, total, books, next } | null }
+// The book's series in order (from Audible's catalogue) for "Next in series".
+app.get("/:config/app/series/:id", async (req, res) => {
+  const cfg = getConfig(req, res);
+  if (!cfg) return;
+  const item = decodeItemId(req.params.id);
+  if (!item) return res.status(400).json({ error: "Bad item id" });
+  if (item.legacyComic) return comicsGone(res);
+  res.json({ series: await seriesFor(item.name) });
+});
+
+// GET /:config/app/similar/:id -> { similar: { because, books } | null }
+// "Because you listened to…": books Audible's listeners also enjoyed, and the
+// author's other books, outside this book's own series.
+app.get("/:config/app/similar/:id", async (req, res) => {
+  const cfg = getConfig(req, res);
+  if (!cfg) return;
+  const item = decodeItemId(req.params.id);
+  if (!item) return res.status(400).json({ error: "Bad item id" });
+  if (item.legacyComic) return comicsGone(res);
+  res.json({ similar: await similarFor(item.name) });
+});
+
+// GET /:config/app/version  -> latest native APK info (for in-app update prompt):
+// from APP_LATEST_VERSION/APP_APK_URL, else the app repo's latest GitHub release.
+app.get("/:config/app/version", async (req, res) => {
+  const cfg = getConfig(req, res);
+  if (!cfg) return;
+  res.json(await appRelease());
 });
 
 async function handleHealth(req, res) {
   const cfg = decodeConfig(req.params.config || "");
+  // A configured health check is the app's pre-save validation of an install
+  // link, so it must enforce the access token like every other route —
+  // otherwise a link with a wrong token connects, then every search 403s.
+  // (It also stops tokenless callers using this route to test TorBox keys.)
+  if (cfg && cfg.apiKey && !access.valid(cfg.token)) {
+    return res.status(403).json({ ok: false, err: "Invalid or missing access token for this instance." });
+  }
   const out = {
     ok: true,
     addon: manifest.name,
@@ -598,12 +553,6 @@ async function handleHealth(req, res) {
     out.sources = {
       audiobookbay: !!(cfg.abbDomain || process.env.ABB_DOMAIN),
       jackett: hasJackett,
-      // Comics search rides on Jackett (Torznab category 7030), so its
-      // availability IS Jackett's availability.
-      comics: hasJackett,
-      // The Series source (MangaDex) needs no user config; this key's
-      // presence is the app's capability probe for the Series chip.
-      mangadex: mangadexEnabled(),
       serverProvided: !!(process.env.JACKETT_URL && process.env.JACKETT_API_KEY) || !!process.env.ABB_DOMAIN,
     };
     out.abbDomain = cfg.abbDomain || process.env.ABB_DOMAIN || null;
@@ -617,7 +566,13 @@ async function handleHealth(req, res) {
 app.get("/health", handleHealth);
 app.get("/:config/health", handleHealth);
 
-app.listen(PORT, () => {
-  console.log(`BusTAudioBooks addon running on http://127.0.0.1:${PORT}`);
-  console.log(`Open http://127.0.0.1:${PORT}/configure to generate your install link.`);
-});
+// Listen only when run directly (npm start / Docker / systemd), so tests can
+// import the app and bind it to an ephemeral port.
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`BusTAudioBooks addon running on http://127.0.0.1:${PORT}`);
+    console.log(`Open http://127.0.0.1:${PORT}/configure to generate your install link.`);
+  });
+}
+
+module.exports = { app };

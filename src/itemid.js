@@ -13,12 +13,6 @@ function encodeItemId(item) {
       f: item.format || undefined,
       b: item.bitrate || undefined,
       s: item.size || undefined,
-      // Content-type discriminator. Absent = audiobook, so ids minted before
-      // comics existed keep decoding exactly as they always did.
-      t: item.type === "comic" ? "c" : undefined,
-      // Provider discriminator + MangaDex manga uuid. Absent = torrent.
-      p: item.provider === "mangadex" ? "m" : undefined,
-      d: item.mangaId || undefined,
     }),
     "utf8"
   ).toString("base64url");
@@ -39,9 +33,9 @@ function decodeItemId(id) {
       format: obj.f,
       bitrate: obj.b,
       size: obj.s,
-      type: obj.t === "c" ? "comic" : "audiobook",
-      provider: obj.p === "m" ? "mangadex" : "torrent",
-      mangaId: obj.d,
+      // Ids minted for comics (removed in 3.0) carried t:"c" or p:"m"; they
+      // are recognised only so the API can say comics are gone.
+      legacyComic: obj.t === "c" || obj.p === "m",
     };
   } catch (_) {
     return null;

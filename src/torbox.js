@@ -14,6 +14,7 @@
 const http = require("http");
 const https = require("https");
 const { pLimit } = require("./cache");
+const { parseNameParts } = require("./metadata");
 
 const API_BASE = "https://api.torbox.app/v1/api";
 
@@ -41,20 +42,6 @@ function authHeaders(apiKey) {
 function isAudioFile(name) {
   const lower = (name || "").toLowerCase();
   return AUDIO_EXTENSIONS.some((ext) => lower.endsWith(ext));
-}
-
-// Comic torrents are either page archives (.cbz = zip, .cbr = rar, ...) or a
-// loose folder of page images. Both count — the app reads CBZ/images directly
-// and offers the rest as downloads.
-const COMIC_EXTENSIONS = [".cbz", ".cbr", ".cb7", ".cbt", ".pdf"];
-const IMAGE_EXTENSIONS = [".jpg", ".jpeg", ".png", ".webp", ".avif"];
-
-function isComicFile(name) {
-  const lower = (name || "").toLowerCase();
-  return (
-    COMIC_EXTENSIONS.some((ext) => lower.endsWith(ext)) ||
-    IMAGE_EXTENSIONS.some((ext) => lower.endsWith(ext))
-  );
 }
 
 // Formats the Stremio *web* player can generally handle. Others (m4b, flac, ...)
@@ -239,12 +226,73 @@ async function getMyList(apiKey, { id } = {}) {
   return json.data; // array, or single object when id is provided
 }
 
+function filesReady(t) {
+  return t.download_present === true || t.download_finished === true || (Array.isArray(t.files) && t.files.length > 0);
+}
+
+// The account's entry for this hash. A torrent added more than once can leave
+// a stalled duplicate next to the finished copy: prefer finished, then the
+// furthest along.
+function pickByHash(list, hash) {
+  const target = hash.toLowerCase();
+  const matches = (Array.isArray(list) ? list : []).filter((t) => (t.hash || "").toLowerCase() === target);
+  matches.sort((a, b) => (filesReady(b) - filesReady(a)) || ((b.progress || 0) - (a.progress || 0)));
+  return matches[0] || null;
+}
+
 // Find a torrent the user already has by infohash.
 async function findTorrentByHash(apiKey, hash) {
-  const list = await getMyList(apiKey);
-  if (!Array.isArray(list)) return null;
-  const target = hash.toLowerCase();
-  return list.find((t) => (t.hash || "").toLowerCase() === target) || null;
+  return pickByHash(await getMyList(apiKey), hash);
+}
+
+// ---- the same book, another upload -------------------------------------------
+// Audiobook sites list several uploads of one book. If a different upload of
+// this book is already finished in the account (you picked another search
+// result before), use it rather than wait on this one. Strict on purpose: every
+// word of the title must be there, and nothing but the author and format noise
+// besides — another volume ("… 2") or edition ("Full Cast") isn't the same book.
+const NAME_NOISE = new Set([
+  "the", "a", "an", "of", "and", "by", "read", "narrated", "unabridged", "abridged", "audiobook", "audiobooks",
+  "audio", "book", "mp3", "m4b", "m4a", "aac", "flac", "ogg", "opus", "kbps", "khz", "vbr", "cbr", "retail", "complete",
+  "32", "48", "56", "62", "64", "96", "128", "192", "256", "320",
+]);
+function nameWords(text) {
+  return String(text || "")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/['’]/g, "")
+    .split(/[^a-z0-9]+/)
+    .map((w) => w.replace(/^0+(\d)/, "$1"))
+    .filter((w) => w && !NAME_NOISE.has(w) && !/^(19|20)\d\d$/.test(w) && !/^\d+(kbps|khz|k)$/.test(w));
+}
+function sameBook(itemName, torrentName) {
+  const { title, author } = parseNameParts(itemName);
+  const want = nameWords(title);
+  if (want.length === 0) return false;
+  const have = new Set(nameWords(torrentName));
+  if (!want.every((w) => have.has(w))) return false;
+  const allowed = new Set([...want, ...nameWords(author)]);
+  const extra = [...have].filter((w) => !allowed.has(w));
+  return extra.length <= 1 && !extra.some((w) => /^\d+$/.test(w));
+}
+function readyCopyOf(list, name, hash) {
+  if (!name || !Array.isArray(list)) return null;
+  const own = (hash || "").toLowerCase();
+  return list.find((t) => filesReady(t) && (t.hash || "").toLowerCase() !== own && sameBook(name, t.name)) || null;
+}
+
+// What to tell someone waiting on a torrent that isn't ready, from TorBox's
+// own state: stalled and queued torrents shouldn't look like progress.
+function waitingStatus(t) {
+  const pct = typeof t.progress === "number" ? ` (${Math.round(t.progress * 100)}%)` : "";
+  const state = String(t.download_state || "").toLowerCase();
+  if (/stalled|no seed/.test(state)) return `Stalled on TorBox${pct}: nobody is sharing this upload right now. Try another search result, or check back later.`;
+  if (/meta/.test(state)) return "TorBox is fetching this torrent's details. Try again shortly.";
+  if (/queued/.test(state)) return `Queued on TorBox${pct}. It starts when one of your download slots frees up.`;
+  if (/paused/.test(state)) return `Paused on TorBox${pct}. Resume it on torbox.app.`;
+  if (/error|fail|expired/.test(state)) return `TorBox couldn't download this upload (${t.download_state}). Try another search result.`;
+  return `Downloading on TorBox${pct}. Try again shortly.`;
 }
 
 // Get a direct, downloadable link for one file inside a torrent.
@@ -278,7 +326,7 @@ function formatBytes(bytes) {
 // Returns { ready: boolean, streams: [...], status: string }
 //   ready === false means TorBox is still downloading an uncached torrent; the
 //   caller should surface a "preparing" message and let the user retry.
-async function resolveStreams(apiKey, { magnet, infohash, name, torrentUrl, instantOnly = false, kind = "audio" }) {
+async function resolveStreams(apiKey, { magnet, infohash, name, torrentUrl, instantOnly = false }) {
   let hash = infohash ? infohash.toLowerCase() : infohashFromMagnet(magnet);
   if (!hash && !magnet && !torrentUrl) {
     throw new Error("No infohash, magnet, or torrent link provided");
@@ -286,7 +334,16 @@ async function resolveStreams(apiKey, { magnet, infohash, name, torrentUrl, inst
   if (!magnet && hash) magnet = magnetFromInfohash(hash, name);
 
   // 1. Is it already in the user's account? (Only checkable if we know the hash.)
-  let torrent = hash ? await findTorrentByHash(apiKey, hash) : null;
+  const list = await getMyList(apiKey);
+  let torrent = hash ? pickByHash(list, hash) : null;
+
+  // Another upload of this book that's already finished in the account beats
+  // waiting on this one — unless this one is cached and so instant anyway.
+  const copy = !torrent || !filesReady(torrent) ? readyCopyOf(list, name, hash) : null;
+  if (copy && (torrent || !(hash && (await checkCached(apiKey, hash).catch(() => false))))) {
+    console.log(`[torbox] ${hash || name}: not ready; using your finished copy "${copy.name}" (${copy.hash})`);
+    torrent = copy;
+  }
 
   // Instant-only mode: never trigger an uncached download. If it isn't already
   // in the account and isn't cached, bail early. (Only possible when we know the
@@ -323,30 +380,19 @@ async function resolveStreams(apiKey, { magnet, infohash, name, torrentUrl, inst
   // We now have the real hash from TorBox (needed for bingeGroup / dedupe).
   hash = (torrent.hash || hash || "").toLowerCase();
 
-  const filesReady =
-    torrent.download_present === true ||
-    torrent.download_finished === true ||
-    (Array.isArray(torrent.files) && torrent.files.length > 0);
-
-  if (!filesReady) {
-    const pct = typeof torrent.progress === "number"
-      ? ` (${Math.round(torrent.progress * 100)}%)`
-      : "";
-    return {
-      ready: false,
-      streams: [],
-      status: `Downloading on TorBox${pct}. Try again shortly.`,
-    };
+  if (!filesReady(torrent)) {
+    // In the server log, so a stuck book can be explained.
+    console.log(`[torbox] ${hash} not ready: id=${torrent.id} state=${torrent.download_state} progress=${torrent.progress} seeds=${torrent.seeds} finished=${torrent.download_finished} present=${torrent.download_present} files=${(torrent.files || []).length}`);
+    return { ready: false, streams: [], status: waitingStatus(torrent) };
   }
 
-  // 3. Build a stream per relevant file (audio files, or comic archives/pages).
-  const wantFile = kind === "comic" ? isComicFile : isAudioFile;
+  // 3. Build a stream per audio file.
   const matchedFiles = (torrent.files || [])
-    .filter((f) => wantFile(f.name || f.short_name))
+    .filter((f) => isAudioFile(f.name || f.short_name))
     .sort((a, b) => String(a.name).localeCompare(String(b.name), undefined, { numeric: true }));
 
-  // Request links concurrently (bounded) — a loose-image comic can have
-  // hundreds of page files, and doing these serially would take minutes.
+  // Request links concurrently (bounded) — a book split into a hundred
+  // parts would take minutes serially.
   const resolved = await Promise.all(
     matchedFiles.map((file) =>
       limitRequestDl(async () => {
@@ -373,15 +419,17 @@ async function resolveStreams(apiKey, { magnet, infohash, name, torrentUrl, inst
       behaviorHints: {
         bingeGroup: `torbox-${hash}`,
         filename: shortName,
-        // Browsers can't play m4b/flac/etc. (and never comic archives);
-        // hint Stremio to use an external player.
-        notWebReady: kind === "comic" || !webReadyForFile(shortName),
+        // Stremio's standard size hint; the app API also exposes it per file
+        // so the app can estimate whole-book length for multi-part books.
+        ...(r.file.size > 0 ? { videoSize: r.file.size } : {}),
+        // Browsers can't play m4b/flac/etc.; hint Stremio to use an external player.
+        notWebReady: !webReadyForFile(shortName),
       },
     });
   }
 
   if (streams.length === 0) {
-    return { ready: false, streams: [], status: `No ${kind} files found in this torrent.` };
+    return { ready: false, streams: [], status: "No audio files found in this torrent." };
   }
   return { ready: true, streams, status: "ok" };
 }
@@ -389,7 +437,6 @@ async function resolveStreams(apiKey, { magnet, infohash, name, torrentUrl, inst
 module.exports = {
   API_BASE,
   isAudioFile,
-  isComicFile,
   webReadyForFile,
   infohashFromMagnet,
   magnetFromInfohash,
@@ -400,6 +447,9 @@ module.exports = {
   createTorrentFromUrl,
   getMyList,
   findTorrentByHash,
+  pickByHash,
+  sameBook: sameBook,
+  waitingStatus,
   requestDownloadLink,
   resolveStreams,
   formatBytes,
